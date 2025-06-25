@@ -12,6 +12,10 @@ import matplotlib.pyplot as plt
 import sys
 from collections import defaultdict
 import os, glob, concurrent.futures
+plt.rcParams["font.size"] = 23
+plt.rcParams["figure.figsize"] = [12, 8]
+plt.rcParams["figure.dpi"] = 400
+plt.rcParams['font.family'] = 'DejaVu Sans'
 def get_sample_dirs(base_dir: str) -> List[str]:
     """
     base_dir 以下の 2 階層下で "fig_and_log" を含むディレクトリを返す。
@@ -149,15 +153,15 @@ def plot_instability_curve(
     mean (y) ± std を帯域表示した折れ線図を保存。
     """
     fig, ax = plt.subplots(figsize=(8,5), dpi=300)
-    ax.plot(x, y, linewidth=2, zorder=3)
+    ax.plot(x, y, linewidth=2, zorder=3,color="blue")
     if std is not None:
-        ax.fill_between(x, y - std, y + std, alpha=0.2, zorder=2)
+        ax.fill_between(x, y - std, y + std, alpha=0.2, zorder=2,color="blue")
     ax.set_xlabel(xlabel)
     ax.set_ylabel(ylabel)
     if y_lim is not None:
         ax.set_ylim(y_lim)
     if log_scale_x:
-        ax.set_xscale('log')
+        ax.set_xscale('symlog')
     fig.tight_layout()
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
     fig.savefig(save_path)
@@ -244,6 +248,8 @@ def evaluate_label_changes_all(
     return all_scores
 
 
+from pathlib import Path
+
 def aggregate_instability_across_samples(
     sample_dirs:  List[str],
     target:       str,
@@ -253,6 +259,7 @@ def aggregate_instability_across_samples(
 ) -> pd.DataFrame:
     """
     各サンプルのスコア CSV を読み込み、x_value ごとの mean/std を返す DataFrame。
+    該当CSVが存在しない場合、mode=epochに限り自動的に再生成を試みる。
     """
     # suffix
     suffix = ''
@@ -264,21 +271,44 @@ def aggregate_instability_across_samples(
     for d in sample_dirs:
         base = os.path.join(d, 'fig_and_log')
         if mode == 'alpha':
-            # fname = f'label_change_scores_alpha{suffix}.csv'
             fname = f'label_change_scores_alpha.csv'
             x_col, y_col = 'epoch', 'label_change'
-        else:
+        elif mode == 'epoch':
             fname = f'epoch_unsmoothed_scores{suffix}.csv'
             x_col, y_col = 'alpha', 'unsmoothed_scores'
+        else:
+            raise ValueError(f"Unsupported mode: {mode}")
+
         fpath = os.path.join(base, fname)
+
+        if not os.path.exists(fpath) and mode == 'epoch':
+            print(f"[Info] {fpath} not found, regenerating from raw epoch files...")
+            try:
+                evaluate_label_changes(
+                    pair_csv_dir=os.path.join(d, 'csv'),
+                    output_dir=base,
+                    mode='epoch',
+                    y_scale=y_scale,
+                    epoch_start=epoch_range[0] if epoch_range else None,
+                    epoch_end=epoch_range[1] if epoch_range else None,
+                    plot=False
+                )
+            except Exception as e:
+                print(f"[Error] Failed to regenerate instability CSV for {d}: {e}")
+                continue  # skip this dir
+
         if not os.path.exists(fpath):
             print(f"[Warn] missing {fpath}")
             continue
+
         df = pd.read_csv(fpath)
         for _, row in df.iterrows():
             rows.append((row[x_col], row[y_col]))
+
     if not rows:
+        print("[Error] No valid data rows found. Returning empty DataFrame.")
         return pd.DataFrame()
+
     df_all = pd.DataFrame(rows, columns=['x', 'score'])
     stats = df_all.groupby('x')['score'].agg(['mean','std']).reset_index()
     stats.rename(columns={'x':'x_value','mean':'mean_score','std':'std_score'}, inplace=True)
@@ -299,19 +329,21 @@ def plot_aggregate_instability(
     """
     fig, ax = plt.subplots(figsize=(8,5), dpi=300)
     x = stats_df['x_value'].to_numpy()
-    y = stats_df['mean_score'].to_numpy()
-    std = stats_df['std_score'].to_numpy()
+    y = stats_df['mean_score'].to_numpy()/100
+    std = stats_df['std_score'].to_numpy()/100
     if highlight:
         for v in highlight:
             ax.axvline(v, color='gray', linestyle='--')
-    ax.plot(x, y, linewidth=2, zorder=3)
-    ax.fill_between(x, y-std, y+std, alpha=0.2, zorder=2)
+    ax.plot(x, y, linewidth=2, zorder=3,label="$INST_s(\\chi,t)$",color="blue")
+    ax.fill_between(x, y-std, y+std, alpha=0.2, zorder=2,color="blue")
     ax.set_xlabel(xlabel)
     ax.set_ylabel(ylabel)
     if y_lim:
         ax.set_ylim(y_lim)
     if log_scale_x:
         ax.set_xscale('log')
+    ax.legend()
+    ax.grid(True)
     fig.tight_layout()
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
     fig.savefig(save_path)
@@ -593,17 +625,121 @@ def analyze_all_temporal_instability(base_root, widths, output_dir, target_row=N
         plt.savefig(plot_path)
         plt.close()
         print(f"[✓] Saved plot for alpha={alpha:.3f}")
+
+def save_spatial_instability_epoch_summary(
+    base_root: str,
+    widths: List[int],
+    y_scale: str = 'ratio',
+    target_epoch: int = 4000,
+    output_path: str = './spatial_instability_epoch_summary.csv'
+):
+    """
+    各 width に対して、target_epoch における Spatial Instability の
+    平均と標準偏差（noise / no_noise）を1つのCSVに記録。
+
+    出力列：width, noise_mean, noise_std, no_noise_mean, no_noise_std
+    """
+    records = []
+
+    for width in widths:
+        print(f"[Info] Processing width={width}...")
+
+        row_data = {'width': width}
+
+        for noise_type in ['noise', 'no_noise']:
+            base_dir = os.path.join(base_root, str(width), noise_type)
+            sample_dirs = get_sample_dirs(base_dir)
+
+            stats_df = aggregate_instability_across_samples(
+                sample_dirs=sample_dirs,
+                target="combined",
+                mode="alpha",
+                y_scale=y_scale,
+                epoch_range=(target_epoch, target_epoch)
+            )
+
+            row = stats_df[stats_df['x_value'] == target_epoch]
+            if row.empty:
+                print(f"[Warn] No data at epoch={target_epoch} for width={width}, type={noise_type}")
+                row_data[f"{noise_type}_mean"] = None
+                row_data[f"{noise_type}_std"] = None
+                continue
+
+            row_data[f"{noise_type}_mean"] = float(row['mean_score'].values[0])
+            row_data[f"{noise_type}_std"] = float(row['std_score'].values[0])
+
+        records.append(row_data)
+
+    # CSV保存
+    df_out = pd.DataFrame(records)
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    df_out.to_csv(output_path, index=False)
+    print(f"[✓] Summary CSV saved to: {output_path}")
+
+
+
+
 if __name__ == '__main__':
-    print("[Info] Analyzing temporal instability for all alpha values...")
-    try:
-        analyze_all_temporal_instability(
-            base_root='/workspace/alpha_test/cifar10/0.2',
-            widths=[1, 2, 4, 8,10,12,16, 32, 64],
-            output_dir='/workspace/alpha_test/cifar10/0.2/temporal_instability_analysis',
-            target_row=None  # すべてのalphaを解析
+#     widths = [1, 2, 4, 8, 10, 12, 16, 32, 64]
+
+#     save_spatial_instability_epoch_summary(
+#     base_root='alpha_test/cifar10/0.2',
+#     widths=[1, 2, 4, 8, 10, 12, 16, 32, 64],
+#     y_scale='ratio',
+#     target_epoch=4000,  # ここで任意のepochを指定
+#     output_path='alpha_test/cifar10/0.2/figure/spatial_inst_epoch4000_summary.csv'
+# )
+    mode="noise"
+    widths = [64]
+    for width in widths:
+        print(f"[Info] Processing width={width}...")
+
+        base_dir = f"alpha_test/emnist_digits/0.2/8/{mode}"
+        sample_dirs = get_sample_dirs(base_dir)
+
+        stats_df = aggregate_instability_across_samples(
+            sample_dirs=sample_dirs,
+            target="combined",
+            mode="epoch",  # spatial instability
+            y_scale="ratio",
+            epoch_range=(0, 2000)
         )
-    except Exception as e:
-        print(f"[Error] Failed to analyze temporal instability: {e}")
+
+        save_dir = "/workspace/vizualize/ACML/EMNIST"
+        save_path = os.path.join(save_dir, f"spatial_instability_width_8{mode}.svg")
+        save_path2=os.path.join(save_dir, f"spatial_instability_width_8{mode}.pdf")
+        plot_aggregate_instability(
+            stats_df=stats_df,
+            xlabel="Epoch",
+            ylabel="Spatial Instability",
+            save_path=save_path,
+            log_scale_x=True,
+            y_lim=(-0.001, 0.031)
+        )
+        plot_aggregate_instability(
+            stats_df=stats_df,
+            xlabel="Epoch",
+            ylabel="Spatial Instability",
+            save_path=save_path2,
+            log_scale_x=True,
+            y_lim=(-0.001, 0.031)
+
+        )
+        
+
+    
+    
+    
+    # print("[Info] Analyzing temporal instability for all alpha values...")
+    # try:
+    #     analyze_all_temporal_instability(
+    #         base_root='/workspace/alpha_test/cifar10/0.2',
+    #         widths=[1, 2, 4, 8,10,12,16, 32, 64],
+    #         output_dir='/workspace/alpha_test/cifar10/0.2/temporal_instability_analysis',
+    #         target_row=None  # すべてのalphaを解析
+    #     )
+    # except Exception as e:
+    #     print(f"[Error] Failed to analyze temporal instability: {e}")
 # if __name__ == '__main__':
 #     print("[Info] Plotting mean match rates per epoch...")
 #     try:
