@@ -2,7 +2,6 @@
 import math
 import pandas as pd
 from pathlib import Path
-import path
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -461,6 +460,98 @@ def alpha_interpolation_test_save_combined_only(model, x_clean, x_noisy, label_x
         'raw_probabilities': output_probs.cpu().numpy().tolist(),
         'label_matches': label_matches.cpu().numpy().tolist()
     }
+def find_pairs_from_csv_by_mode(x_train, noise_info, y_original_train, csv_path,
+                                 distance_metric='euclidean', mode='noise'):
+    """
+    CSVファイルからクエリインデックスを読み込み、それぞれに対して同じラベルの候補から最近傍を1つ探す。
+
+    Parameters:
+        x_train (Tensor): 学習サンプル画像 [N, C, H, W]
+        noise_info (Tensor): ノイズフラグ [N]（0: clean, 1: noisy）
+        y_original_train (Tensor): ノイズなしの正解ラベル [N]
+        csv_path (str): クエリインデックスを含むCSVファイルのパス。
+                        'sample_index'という列名を持つことを想定。
+        distance_metric (str): 'euclidean', 'cosine', 'l1', 'linf'
+        mode (str): 'noise' or 'no_noise'
+
+    Returns:
+        List[Dict]: 各ペアの dict（query_index, matched_index, label, distance）
+    """
+    device = x_train.device
+    N = x_train.size(0)
+    x_flat = x_train.view(N, -1)
+
+    # CSVからクエリインデックスを読み込む
+    try:
+        df = pd.read_csv(csv_path)
+        if 'sample_index' not in df.columns:
+            raise ValueError("CSVファイルに 'sample_index' 列が見つかりません。")
+        query_indices_selected = df['sample_index'].tolist()
+    except FileNotFoundError:
+        raise FileNotFoundError(f"指定されたCSVファイルが見つかりません: {csv_path}")
+
+    # 候補サンプルのインデックスを決定する
+    if mode == 'noise':
+        # クエリがノイズありサンプルの場合、候補はノイズなしサンプル
+        candidate_indices_all = (noise_info == 0).nonzero(as_tuple=True)[0]
+    elif mode == 'no_noise':
+        # クエリがノイズなしサンプルの場合、候補もノイズなしサンプル
+        candidate_indices_all = (noise_info == 0).nonzero(as_tuple=True)[0]
+    else:
+        raise ValueError(f"Unknown mode: {mode}")
+
+    pairs = []
+
+    for query_idx in query_indices_selected:
+        # クエリインデックスが有効範囲内か確認
+        if query_idx >= N:
+            print(f"Warning: インデックス {query_idx} はデータセットの範囲外です。スキップします。")
+            continue
+
+        label = y_original_train[query_idx].item()
+        
+        # 同じラベルを持つ候補を絞り込む
+        same_label_candidates = candidate_indices_all[y_original_train[candidate_indices_all] == label]
+
+        # 'no_noise'モードの場合、クエリ自身を候補から除外する
+        if mode == 'no_noise':
+            same_label_candidates = same_label_candidates[same_label_candidates != query_idx]
+
+        # 候補がない場合はスキップ
+        if len(same_label_candidates) == 0:
+            continue
+
+        x_query = x_flat[query_idx].unsqueeze(0)
+        x_candidates = x_flat[same_label_candidates]
+
+        # 距離を計算
+        if distance_metric == 'euclidean':
+            dists = torch.norm(x_query - x_candidates, dim=1)
+        elif distance_metric == 'cosine':
+            x_q = x_query / (x_query.norm(dim=1, keepdim=True) + 1e-8)
+            x_c = x_candidates / (x_candidates.norm(dim=1, keepdim=True) + 1e-8)
+            # torch.mmは2Dテンソルを要求するため、x_c.Tで転置する
+            dists = 1 - torch.mm(x_q, x_c.T).squeeze()
+        elif distance_metric == 'l1':
+            dists = torch.sum(torch.abs(x_query - x_candidates), dim=1)
+        elif distance_metric == 'linf':
+            dists = torch.max(torch.abs(x_query - x_candidates), dim=1)[0]
+        else:
+            raise ValueError(f"Unknown distance metric: {distance_metric}")
+
+        # 最近傍のインデックスと距離を見つける
+        min_idx_in_candidates = torch.argmin(dists)
+        matched_idx = same_label_candidates[min_idx_in_candidates].item()
+        distance = dists[min_idx_in_candidates].item()
+
+        pairs.append({
+            "query_index": query_idx,
+            "matched_index": matched_idx,
+            "label": label,
+            "distance": distance
+        })
+
+    return pairs
 def find_random_n_pairs_by_mode(x_train, noise_info, y_original_train, n,
                                  distance_metric='euclidean', mode='noise'):
     """
@@ -615,17 +706,23 @@ def save_tensor_image(tensor, save_path, dataset, clean_label, noisy_label):
         mean = [0.4914, 0.4822, 0.4465]
         std = [0.2023, 0.1994, 0.2010]
         inv_transform = transforms.Normalize(
-            mean=[-m/s for m, s in zip(mean, std)],
-            std=[1/s for s in std]
+            mean=[-m / s for m, s in zip(mean, std)],
+            std=[1 / s for s in std]
         )
         tensor = inv_transform(tensor)
 
     np_img = tensor.detach().cpu().numpy()
+
+    # shape (3, H, W) → (H, W, 3) for RGB
     if np_img.shape[0] == 3:
         np_img = np.transpose(np_img, (1, 2, 0))
 
+    # shape (1, H, W) → (H, W) for grayscale
+    elif np_img.shape[0] == 1:
+        np_img = np_img.squeeze(0)
+
     plt.figure(figsize=(2, 2), dpi=150)
-    plt.imshow(np.clip(np_img, 0, 1))
+    plt.imshow(np.clip(np_img, 0, 1), cmap='gray' if np_img.ndim == 2 else None)
     plt.title(f"Clean: {clean_label} / Noisy: {noisy_label}")
     plt.axis('off')
     plt.savefig(save_path, bbox_inches='tight')
@@ -661,7 +758,8 @@ def main():
                 raise ValueError("Dataset cannot be converted to TensorDataset.")
 
         x_original_train, y_original_train = train_dataset_original.tensors
-        experiment_name = f'seed_{args.fix_seed}width{args.model_width}_{args.model}_{args.dataset}_variance{args.variance}_{args.target}_lr{args.lr}_batch{args.batch_size}_epoch{args.epoch}_LabelNoiseRate{args.label_noise_rate}_Optim{args.optimizer}_Momentum{args.momentum}'
+        # experiment_name = f'test_seed_{args.fix_seed}width{args.model_width}_{args.model}_{args.dataset}_variance{args.variance}_{args.target}_lr{args.lr}_batch{args.batch_size}_epoch{args.epoch}_LabelNoiseRate{args.label_noise_rate}_Optim{args.optimizer}_Momentum{args.momentum}'
+        experiment_name = f'test_seed_{args.fix_seed}width{args.model_width}_{args.model}_{args.dataset}_variance{args.variance}_{args.target}_lr{args.lr}_batch{args.batch_size}_epoch{args.epoch}_LabelNoiseRate{args.label_noise_rate}_Optim{args.optimizer}_Momentum{args.momentum}'
 
         print('Creating noisy datasets...')
         train_dataset, test_dataset, meta = load_or_create_noisy_dataset(
@@ -670,7 +768,7 @@ def main():
         imagesize = meta["imagesize"]
         num_classes = meta["num_classes"]
         in_channels = meta["in_channels"]
-
+        print("in_channels:", in_channels)
         if isinstance(train_dataset, NoisyDataset):
             print("NoisyDataset detected.")
             x_train_noisy, y_train_noisy = get_tensor_dataset_components(train_dataset)
@@ -688,7 +786,7 @@ def main():
         #     distance_metric=args.distance_metric,
         #     mode=args.mode
         # )
-       
+        # save_pair_log(pairs, args)
         pairs = load_saved_pairs_by_mode(args, base_dir="alpha_test")
 
         # save_pair_log(pairs, args)
@@ -719,7 +817,7 @@ def main():
             save_tensor_image(x_matched, fig_and_log_dir / "matched.png", dataset=args.dataset, clean_label=y_matched.item(), noisy_label=y_train_noisy[matched_idx].item())
 
             for epoch in range(args.epoch + 2):
-                model_path = os.path.join(base_save_dir, f"model_epoch_{epoch}.pth")
+                model_path = os.path.join(base_save_dir, f"epoch_{epoch}.pth")
                 if not os.path.exists(model_path):
                     print(model_path)
                     print(f"  [!] Skip epoch {epoch} (no model found)")
@@ -753,8 +851,8 @@ def main():
                 csv_path = csv_dir / f"epoch_{epoch}.csv"
                 df.to_csv(csv_path, index=False)
 
-            gif_path = fig_and_log_dir / "alpha_plot.gif"
-            generate_alpha_probabilities_gif(data_dir=csv_dir, output_path=str(gif_path))
+            # gif_path = fig_and_log_dir / "alpha_plot.gif"
+            # generate_alpha_probabilities_gif(data_dir=csv_dir, output_path=str(gif_path))
 
             # 評価の実行（raw指定）
             evaluate_label_changes(pair_csv_dir=str(csv_dir), output_dir=str(fig_and_log_dir), mode='alpha', y_lim=None, y_scale='raw', plot_result=True)
