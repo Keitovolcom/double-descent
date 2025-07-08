@@ -1,4 +1,4 @@
-from torch.utils.data import DataLoader, TensorDataset
+
 
 import wandb
 
@@ -14,6 +14,8 @@ import torch.optim as optim
 import numpy as np
 import matplotlib.pyplot as plt
 import traceback
+import gc, queue, multiprocessing as mp
+from torch.distributed import is_initialized, get_rank
 
 from config import parse_args_model_save
 from utils import set_seed, set_device,seed_worker,compute_fraction_of_loss_reduction_from_batch
@@ -21,8 +23,6 @@ from datasets import load_or_create_noisy_dataset, NoisyDataset
 from models import load_models
 from logger import setup_wandb, log_to_wandb
 from dispatch_func import train_model_dispatch,train_model_0_epoch_dispatch,test_model_dispatch
-
-
 
 from torch.utils.data import DataLoader, TensorDataset
 
@@ -35,6 +35,24 @@ def save_metrics(epoch, train_metrics, test_metrics, args, csv_path, wandb_run=N
         _save_metrics_distr_colored(epoch, train_metrics, test_metrics, csv_path, wandb_run)
     else:
         _save_metrics_standard(epoch, train_metrics, test_metrics, csv_path, wandb_run)
+# ---------------------- async_checkpointer.py ----------------------
+def is_main_process():
+    return (not is_initialized()) or get_rank() == 0
+
+def async_save_worker(q: mp.Queue):
+    while True:
+        item = q.get()
+        if item is None:          # poison-pill
+            break
+        path, state = item
+        torch.save(state, path, _use_new_zipfile_serialization=False)
+
+def launch_checkpointer(max_queue=4):
+    q = mp.Queue(maxsize=max_queue)
+    p = mp.Process(target=async_save_worker, args=(q,), daemon=True)
+    p.start()
+    return q, p
+# ------------------------------------------------------------------
 
 
 def _save_metrics_distr_colored(epoch, train_metrics, test_metrics, csv_path, wandb_run):
@@ -155,7 +173,7 @@ def get_tensor_dataset_components(dataset):
 def main():
     print('Start session')
     wandb_run = None
-
+    save_q, save_proc = launch_checkpointer()
     warnings.filterwarnings("ignore")
 
     try:
@@ -207,10 +225,13 @@ def main():
 
         criterion_noisy = nn.CrossEntropyLoss(reduction='none')
         criterion_clean = nn.CrossEntropyLoss(reduction='none')
+        print('wandb is enabled' if args.wandb else 'wandb is disabled')
         if args.wandb:
-            print('Initializing wandb...')
+            print('WandB is enabled')
             experiment_name = f'test_seed_{args.fix_seed}width{args.model_width}_{args.model}_{args.dataset}_variance{args.variance}_{args.target}_lr{args.lr}_batch{args.batch_size}_epoch{args.epoch}_LabelNoiseRate{args.label_noise_rate}_Optim{args.optimizer}_Momentum{args.momentum}'
-            wandb_run = setup_wandb(args, experiment_name)
+            wandb_run = setup_wandb(args, experiment_name) 
+            # print('Initializing wandb...')
+            # wandb_run = setup_wandb(args, experiment_name)
         else:
             experiment_name = f'seed_{args.fix_seed}width{args.model_width}_{args.model}_{args.dataset}_variance{args.variance}_{args.target}_lr{args.lr}_batch{args.batch_size}_epoch{args.epoch}_LabelNoiseRate{args.label_noise_rate}_Optim{args.optimizer}_Momentum{args.momentum}'
 
@@ -219,7 +240,7 @@ def main():
         os.makedirs(os.path.dirname(csv_path), exist_ok=True)
         
         g = torch.Generator()
-        g.manual_seed(args.fix_seed)
+        g.manual_seed(42)
         
         train_loader = DataLoader(
             train_dataset,
@@ -227,6 +248,8 @@ def main():
             shuffle=True,
             num_workers=args.num_workers,
             pin_memory=True,
+            persistent_workers=True,                  # ★NEW
+            prefetch_factor=4,  
             worker_init_fn=seed_worker,
             generator=g,
         )
@@ -249,6 +272,10 @@ def main():
             "train_accuracy": None,
             "test_accuracy": None
         }
+        
+        state = {k: v.detach().half().cpu() for k, v in model.state_dict().items()}
+        save_q.put((os.path.join(base_save_dir, "model_epoch_0.pth"), state))
+        del state; torch.cuda.empty_cache(); gc.collect()
 
         train_metrics0 = train_model_0_epoch_dispatch(
             model=model,
@@ -274,9 +301,10 @@ def main():
         )
 
         save_metrics(0, train_metrics0, test_metrics0, args, csv_path, wandb_run)
-        torch.save(save_dict, os.path.join(base_save_dir, "model_epoch_0.pth"))
+        # torch.save(save_dict, os.path.join(base_save_dir, "model_epoch_0.pth"))
 
         for epoch in range(1, args.epoch + 1):
+            
             try:
                 train_metrics = train_model_dispatch(
                     model=model,
@@ -302,17 +330,29 @@ def main():
                     num_digits=num_digits
                 )
 
-                save_dict = {
-                    "args": vars(args),
-                    "epoch": epoch,
-                    "model_state_dict": model.state_dict(),
-                    "train_accuracy": train_metrics["train_accuracy"] if "train_accuracy" in train_metrics else train_metrics.get("accuracy_total"),
-                    "test_accuracy": test_metrics["test_accuracy"] if "test_accuracy" in test_metrics else test_metrics.get("accuracy_total")
-                }
+                # save_dict = {
+                #     "args": vars(args),
+                #     "epoch": epoch,
+                #     "model_state_dict": model.state_dict(),
+                #     "train_accuracy": train_metrics["train_accuracy"] if "train_accuracy" in train_metrics else train_metrics.get("accuracy_total"),
+                #     "test_accuracy": test_metrics["test_accuracy"] if "test_accuracy" in test_metrics else test_metrics.get("accuracy_total")
+                # }
 
-                torch.save(save_dict, os.path.join(base_save_dir, f"model_epoch_{epoch}.pth"))
+                state = {k: v.detach().half().cpu() for k, v in model.state_dict().items()}
+                save_q.put((os.path.join(base_save_dir, f"model_epoch_{epoch}.pth"), state))
+                del state; torch.cuda.empty_cache(); gc.collect()
+
+                # torch.save(save_dict, os.path.join(base_save_dir, f"model_epoch_{epoch}.pth"))
                 save_metrics(epoch, train_metrics, test_metrics, args, csv_path, wandb_run)
-
+                if epoch % 10 == 0:
+                    summary_log = (
+                        f"[Epoch {epoch}] "
+                        f"TrainErr: {100 - train_metrics.get('train_accuracy', train_metrics.get('accuracy_total', 0)):.2f}% | "
+                        f"CleanErr: {100 - train_metrics.get('train_accuracy_clean', train_metrics.get('accuracy_clean', 0)):.2f}% | "
+                        f"NoisyErr: {100 - train_metrics.get('train_accuracy_noisy', train_metrics.get('accuracy_noisy', 0)):.2f}% || "
+                        f"TestErr: {test_metrics.get('test_error', 100 - test_metrics.get('test_accuracy', test_metrics.get('accuracy_total', 0))):.2f}%"
+                    )
+                    print(summary_log)
             except Exception as e:
                 print(f"Error in epoch {epoch}: {str(e)}")
                 continue
@@ -323,9 +363,13 @@ def main():
         print(f"Error in main: {e}")
         return
     finally:
+        # poison-pill を送って書き込み完了を待つ
+        save_q.put(None)
+        save_proc.join()
+
         if wandb_run:
             wandb_run.finish()
-        print('Training completed')
+    print('Training completed')
 
 if __name__ == '__main__':
     main()
