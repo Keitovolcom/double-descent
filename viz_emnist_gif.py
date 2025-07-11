@@ -1,251 +1,170 @@
 import os
 import glob
+from typing import List
+from itertools import cycle
+
 import pandas as pd
+import numpy as np
 import matplotlib.pyplot as plt
-from matplotlib.widgets import Slider, Button
 from matplotlib.animation import FuncAnimation, PillowWriter
-from pathlib import Path  # pathlibをインポート
 
-# フォントサイズ、図のサイズ、解像度を指定
-plt.rcParams["font.size"] = 14
-plt.rcParams["figure.figsize"] = [12, 8]
-plt.rcParams["figure.dpi"] = 100  # 解像度を向上
+# ------------------------------------------------------------------
+# 提供された関数
+# ------------------------------------------------------------------
 
-def load_data(data_dir):
+def get_highlight_labels_from_path(data_dir):
     """
-    指定されたディレクトリ内のCSVファイルを読み込み、エポックごとにデータを辞書に格納します。
+    data_dir からハイライトすべき2つのラベルを取得する。
+    例: "alpha_test/cifar10/0.2/64/noise/pair0001/7_3/csv" -> (7, 3)
     """
-    files = sorted(glob.glob(os.path.join(data_dir, "alpha_log_epoch_*.csv")))
-    data = {}
-    for file in files:
-        epoch = int(os.path.basename(file).split('_')[-1].split('.')[0])
-        data[epoch] = pd.read_csv(file)
-    return data
+    label_dir = os.path.basename(os.path.dirname(data_dir))  # "7_3"
+    label1, label2 = map(int, label_dir.split("_"))
+    # return label1, label2
+    return label2,label1
 
-def extract_digit(name):
+def get_sample_dirs(base_dir: str) -> List[str]:
     """
-    ディレクトリ名から数字を抽出します。
+    base_dir 以下の 2 階層下で "fig_and_log" を含むディレクトリを返す。
+    例: base_dir = '.../noise'
+        -> ['.../noise/pair0001/7_3', '.../noise/pair0002/1_8', ...]
     """
-    try:
-        digit = int(name)
-        return digit
-    except ValueError:
-        raise ValueError(f"Directory name '{name}' is not a valid integer.")
+    sample_dirs = []
+    if not os.path.exists(base_dir):
+        print(f"[!] ベースディレクトリが見つかりません: {base_dir}")
+        return []
+    
+    # 1階層目 (例: pair0001)
+    for d in os.listdir(base_dir):
+        d_path = os.path.join(base_dir, d)
+        if not os.path.isdir(d_path):
+            continue
+        
+        # 2階層目 (例: 7_3)
+        for sub in os.listdir(d_path):
+            sub_path = os.path.join(d_path, sub)
+            # このディレクトリ内に 'fig_and_log' があるかチェック
+            if os.path.isdir(sub_path) and os.path.exists(os.path.join(sub_path, "fig_and_log")):
+                sample_dirs.append(sub_path)
+    return sample_dirs
 
-def get_highlight_targets(dir_path):
+def generate_alpha_probabilities_gif(data_dir, output_path, epoch_stride=5,
+                                     start_epoch=1, end_epoch=300):
     """
-    ハイライト対象の値を取得します。
-    'no_noise_no_noise' ディレクトリ以下のすべてのラベルを抽出し、整数のリストとして返します。
-    例: 'no_noise_no_noise/0/2/' の場合、[0, 2] を返します。
+    指定した data_dir 内の epoch_*.csv を読み込み、alpha と予測確率の推移を GIF 保存する。
     """
-    # pathlibを使用してパスを分割
-    path = Path(dir_path)
-    parts = path.parts
-
-    try:
-        no_noise_index = parts.index("no_noise_no_noise")
-    except ValueError:
-        raise ValueError(f"Directory path '{dir_path}' does not contain 'no_noise_no_noise'.")
-
-    # 'no_noise_no_noise' の後の部分をすべて取得
-    labels = parts[no_noise_index + 1:]
-
-    highlight_targets = []
-    for label in labels:
-        try:
-            digit = extract_digit(label)
-            highlight_targets.append(digit)
-        except ValueError:
-            print(f"Warning: Label '{label}' is not a valid integer and will be skipped.")
-
-    return highlight_targets
-
-def target_plot_probabilities(sub_dir, gif_output="output.gif", gif=False, epoch_start=None, epoch_end=None, epoch_step=None):
-    """
-    指定されたサブディレクトリ内のCSVデータをプロットし、GIFを生成します。
-    """
-    data_dir = os.path.join(sub_dir, "csv")
-    fig_and_log_dir = os.path.join(sub_dir, "fig_and_log")
-    os.makedirs(fig_and_log_dir, exist_ok=True)
-    gif_output_path = os.path.join(fig_and_log_dir, gif_output)
-
-    data = load_data(data_dir)
-    epochs = sorted(data.keys())
-
-    # epoch範囲指定
-    if epoch_start is not None:
-        epochs = [e for e in epochs if e >= epoch_start]
-    if epoch_end is not None:
-        epochs = [e for e in epochs if e <= epoch_end]
-
-    # epoch間隔指定
-    if epoch_step is not None and epoch_step > 1:
-        epochs = epochs[::epoch_step]
-
-    if len(epochs) == 0:
-        print(f"No CSV files found in {data_dir} within the specified epoch range. Skipping...")
+    csv_files = sorted(glob.glob(os.path.join(data_dir, "epoch_*.csv")))
+    if not csv_files:
+        print(f"[!] CSVファイルが見つかりません: {data_dir}")
         return
 
-    initial_epoch = epochs[0]
-    df = data[initial_epoch]
+    data = {}
+    for f in csv_files:
+        try:
+            epoch = int(os.path.basename(f).split("_")[1].split(".")[0])
+            data[epoch] = pd.read_csv(f)
+        except (IndexError, ValueError):
+            print(f"[!] エポック番号をファイル名から取得できませんでした: {f}")
+            continue
+    
+    if not data:
+        print(f"[!] 有効なエポックデータが読み込めませんでした: {data_dir}")
+        return
 
-    # ハイライト対象取得
-    highlight_targets = get_highlight_targets(sub_dir)
+    all_epochs = sorted(data.keys())
+    filtered_epochs = [e for e in all_epochs if start_epoch <= e <= end_epoch]
+    epochs = filtered_epochs[::epoch_stride]
 
-    fig = plt.figure()
-    ax = fig.add_subplot(111)
-    plt.subplots_adjust(bottom=0.25)  # スライダー領域確保
+    if not epochs:
+        print("[!] 指定された範囲と間隔に一致するエポックがありません。")
+        return
 
-    alpha_values = df['alpha']
+    alpha_values = data[epochs[0]]['alpha']
+    label1, label2 = get_highlight_labels_from_path(data_dir)
+
+    fig, ax = plt.subplots(figsize=(8, 6), dpi=150)
+    cmap = plt.get_cmap('tab20')
+    other_colors = cycle([cmap(i) for i in range(cmap.N)])
     lines = []
-    labels_handled = set()  # 重複ラベルを避けるためのセット
+    df_first = data[epochs[0]]
 
-    for target_val in range(10):
-        column_name = f'digit_probability_{target_val}'
-        if column_name not in df.columns:
-            print(f"Warning: Column '{column_name}' does not exist in the data. Skipping this target.")
-            continue
+    for t in range(100):  # prob_0 から prob_99 までを想定
+        col = f'prob_{t}'
+        if col in df_first.columns:
+            if t == label1:
+                color, lw, zorder, alpha = 'blue', 2.5, 10, 1.0
+            elif t == label2:
+                color, lw, zorder, alpha = 'red', 2.5, 10, 1.0
+            else:
+                color, lw, zorder, alpha = next(other_colors), 0.8, 1, 0.5
+            line, = ax.plot(alpha_values, df_first[col], color=color, linewidth=lw, alpha=alpha, zorder=zorder)
+            lines.append((t, line))
 
-        if target_val in highlight_targets:
-            line_style = '-'
-            label = f'digit_{target_val}'  # 修正: 凡例を 'digit_[label]' の形式に統一
-        else:
-            line_style = '--'
-            label = f'digit_{target_val}'  # 修正: ハイライト以外も同様に 'digit_[label]' に統一
-
-        # 同じラベルが複数回追加されないようにチェック
-        if label in labels_handled:
-            continue
-        labels_handled.add(label)
-
-        line, = ax.plot(alpha_values, df[column_name], line_style, label=label)
-        lines.append(line)
-
-    ax.set_xlabel('Alpha')
-    ax.set_ylabel('Digit Probability')
-    ax.set_title(f'Digit Probability for Epoch {initial_epoch}')
-    ax.set_ylim(-0.1, 1.1)
-
-    # 凡例をグラフの右側外部に配置
-    legend = ax.legend(loc="center left", bbox_to_anchor=(1.02, 0.5), borderaxespad=0)
-    fig.subplots_adjust(right=0.75)  # 凡例が見切れないように右側に余白を確保
+    ax.set_xlabel(r'$\alpha$')
+    ax.set_ylabel('Probability')
+    ax.set_ylim(-0.05, 1.05)
+    ax.set_xticks(np.arange(-0.5, 1.6, 0.5))
+    # ax.grid(True, linestyle='--', alpha=0.6)
+    ax.set_title(f"Alpha Interpolation (Epoch {epochs[0]})")
 
     def update(epoch):
-        """
-        プロットを指定されたエポックのデータに更新します。
-        """
-        if epoch not in data:
-            print(f"Warning: Epoch {epoch} not found in data. Skipping update.")
-            return
-        df_epoch = data[epoch]
-        ax.set_title(f'Digit Probability for Epoch {epoch}')
-        for t, line in enumerate(lines):
-            column_name = f'digit_probability_{t}'
-            if column_name not in df_epoch.columns:
-                print(f"Warning: Column '{column_name}' does not exist in the data for epoch {epoch}. Skipping this line.")
-                continue
-            line.set_ydata(df_epoch[column_name])
-        fig.canvas.draw_idle()
+        ax.set_title(f"Alpha Interpolation (Epoch {epoch})")
+        df = data[epoch]
+        for t, line in lines:
+            line.set_ydata(df[f'prob_{t}'])
+        return [line for _, line in lines]
 
-    if gif:
-        # gif=Trueの場合、インタラクティブな表示は行わず、即座にGIFを作成
-        def animate(frame):
-            epoch = epochs[frame]
-            update(epoch)
-            return lines
+    anim = FuncAnimation(fig, update, frames=epochs, interval=200, blit=True)
+    
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    anim.save(output_path, writer=PillowWriter(fps=8))
+    plt.close(fig)
+    print(f"[✓] GIFを保存しました: {output_path}")
 
-        anim = FuncAnimation(fig, animate, frames=len(epochs), interval=200, blit=False)
-        anim.save(gif_output_path, writer=PillowWriter(fps=10))
-        print(f"GIF saved as {gif_output_path}")
-        plt.close(fig)
-    else:
-        # gif=Falseの場合のみスライダー表示とGIFボタン生成
-        ax_epoch = plt.axes([0.25, 0.1, 0.65, 0.03], facecolor='lightgoldenrodyellow')
-        epoch_slider = Slider(
-            ax=ax_epoch,
-            label='Epoch',
-            valmin=epochs[0],
-            valmax=epochs[-1],
-            valinit=initial_epoch,
-            valstep=epochs
+# ------------------------------------------------------------------
+# メイン関数の実装
+# ------------------------------------------------------------------
+
+def main():
+    """
+    メイン関数。
+    設定項目で指定されたベースディレクトリ内の各サンプルに対してGIF画像を生成します。
+    """
+    # --- ⚙️ 設定項目 ---
+    # ここで処理したいベースディレクトリのパスを指定してください
+    BASE_DIR = './alpha_test/emnist_digits/0.2/8/noise'
+    
+    # GIF生成のオプション
+    EPOCH_STRIDE = 1    # GIFに含めるエポックの間隔
+    START_EPOCH = 1     # GIF生成の開始エポック
+    END_EPOCH = 150     # GIF生成の終了エポック
+    # --- 設定はここまで ---
+
+    print(f"[*] サンプルディレクトリを検索中: {BASE_DIR}")
+    sample_dirs = get_sample_dirs(base_dir=BASE_DIR)
+    
+    if not sample_dirs:
+        print(f"[!] 対象ディレクトリが見つかりませんでした: {BASE_DIR}")
+        return
+
+    print(f"[*] {len(sample_dirs)}個のサンプルディレクトリが見つかりました。")
+
+    for sample_dir in sample_dirs:
+        csv_dir = os.path.join(sample_dir, 'csv')
+        gif_path = os.path.join(sample_dir, 'fig_and_log', 'alpha_plot.gif')
+        
+        print(f"\n--- 処理開始: {sample_dir} ---")
+        
+        if not os.path.exists(csv_dir):
+            print(f"[!] CSVディレクトリが見つからないためスキップします: {csv_dir}")
+            continue
+            
+        generate_alpha_probabilities_gif(
+            data_dir=csv_dir, 
+            output_path=gif_path,
+            epoch_stride=EPOCH_STRIDE,
+            start_epoch=START_EPOCH,
+            end_epoch=END_EPOCH
         )
 
-        ax_button = plt.axes([0.85, 0.025, 0.1, 0.04])
-        button = Button(ax_button, 'Save GIF')
-
-        def slider_update(val):
-            epoch = int(epoch_slider.val)
-            update(epoch)
-
-        epoch_slider.on_changed(slider_update)
-
-        def save_gif(event):
-            def animate(frame):
-                epoch = epochs[frame]
-                update(epoch)
-                return lines
-
-            anim = FuncAnimation(fig, animate, frames=len(epochs), interval=200, blit=False)
-            anim.save(gif_output_path, writer=PillowWriter(fps=10))
-            print(f"GIF saved as {gif_output_path}")
-
-        button.on_clicked(save_gif)
-
-        plt.show()
-
-def process_all_subdirs(root_dir, gif=False, selected_dirs=None, epoch_start=None, epoch_end=None, epoch_step=None):
-    """
-    ルートディレクトリ内のすべてのサブディレクトリを処理します。
-    """
-    all_subdirs = [d for d in os.listdir(root_dir) if os.path.isdir(os.path.join(root_dir, d))]
-    if selected_dirs is not None:
-        subdirs_to_process = [d for d in all_subdirs if d in selected_dirs]
-    else:
-        subdirs_to_process = all_subdirs
-
-    for name in subdirs_to_process:
-        sub_dir = os.path.join(root_dir, name)
-        target_plot_probabilities(
-            sub_dir,
-            gif_output=f"d{name}.gif",  # GIF名にサブディレクトリ名を含める
-            gif=gif,
-            epoch_start=epoch_start,
-            epoch_end=epoch_end,
-            epoch_step=epoch_step
-        )
-
-# 使用例
-if __name__ == "__main__":
-    # ベースとなる実験ディレクトリを指定
-    exp_dir = "alpha_test/EMNIST/cnn_5layers_emnist_digits_variance100_combined_lr0.01_batch256_epoch2000_LabelNoiseRate0.2_Optimsgd_Momentum0.0"
-
-    # ルートディレクトリを指定（例として 'no_noise_no_noise/0' ディレクトリを指定）
-    root_dir = os.path.join(exp_dir, "no_noise_no_noise", "0")
-
-    # 必要なディレクトリが存在しない場合は作成
-    os.makedirs(root_dir, exist_ok=True)
-
-    # サブディレクトリ内の '2' を処理
-    process_all_subdirs(
-        root_dir=root_dir,
-        gif=True,              # GIFを作成する場合は True に設定
-        selected_dirs=["1","2","3","4","5","6","7","8","9"],   # 処理したいサブディレクトリ名をリストで指定
-        epoch_start=0,
-        epoch_end=2000,
-        epoch_step=5
-    )
-
-    # 複数のサブディレクトリを処理する場合の例
-    """
-    list = ["1", "2", "3", "4"]
-    for dir_name in list:
-        sub_dir = os.path.join(root_dir, dir_name)
-        process_all_subdirs(
-            sub_dir,
-            gif=True,
-            selected_dirs=None,  # 全てのサブディレクトリを処理
-            epoch_start=0,
-            epoch_end=2000,
-            epoch_step=10
-        )
-    """
+if __name__ == '__main__':
+    main()
