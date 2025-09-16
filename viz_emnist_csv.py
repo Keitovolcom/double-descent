@@ -143,7 +143,7 @@ def target_plot_probabilities_single_epoch_emnist(
     # この部分は元のロジックを簡略化し、常に両方のラベルポイントを示すようにします。
     # 必要に応じて元の `determine_vertical_lines` のような複雑なロジックをここに実装してください。
     ax.plot(0.0, 0.0, marker='o', color='blue', markersize=marker_size)
-    ax.plot(1.0, 0.0, marker='o', color='red', markersize=marker_size)
+    ax.plot(1.0, 0.0, marker='o', color='blue', markersize=marker_size)
 
 
     if show_legend and ax is not None:
@@ -190,7 +190,7 @@ def plot_multiple_epochs_grid_emnist(
 
     last_row = rows - 1
     # タイトル用の文字リスト (元のコードから流用)
-    title_chars = ["H","A","B","C","D","E","F","G"]
+    title_chars = ["A","B","C","D","E","F","G","H"]
 
     for idx, epoch in enumerate(epochs):
         row = idx // columns
@@ -240,8 +240,8 @@ def plot_multiple_epochs_grid_emnist(
 
     if savefig:
         # 保存先は実行ディレクトリからの相対パスなどに適宜変更してください
-        os.makedirs("./output_emnist", exist_ok=True)
-        save_path = os.path.join("./output_emnist", save_filename)
+        os.makedirs("./vizualize/ACML/EMNIST/daihyourei/noise", exist_ok=True)
+        save_path = os.path.join("./vizualize/ACML/EMNIST/daihyourei/noise", save_filename)
         plt.savefig(save_path, format='pdf', dpi=100, bbox_inches='tight', transparent=False)
         print(f"結合した画像を保存しました: {save_path}")
         plt.close(fig)
@@ -253,10 +253,10 @@ def main_emnist_single():
     
     # --- 実行する対象ディレクトリを指定してください ---
     # 例: root_dir = "/path/to/your/data/pair1/9_8"
-    root_dir = "/workspace/data/emnist_pairs/pair1/9_8" # このパスはご自身の環境に合わせてください
+    root_dir = "alpha_test/emnist_digits/0.2/128_kyu_ver2_8_random/noise/pair20/2_6" # このパスはご自身の環境に合わせてください
     
     # --- プロットしたいエポックのリストを指定してください ---
-    epochs_to_plot = [1, 5, 30, 50, 100, 200, 500, 1000]
+    epochs_to_plot = [1, 5, 27, 42, 55, 70, 120, 1000]
 
     # ファイル名をディレクトリ名から自動生成
     pair_name = os.path.basename(os.path.dirname(root_dir))
@@ -268,7 +268,7 @@ def main_emnist_single():
         data_dir=root_dir,
         epochs=epochs_to_plot,
         savefig=True,
-        show_legend=True, # 凡例を表示する場合はTrue
+        show_legend=False, # 凡例を表示する場合はTrue
         save_filename=output_filename,
         columns=4
     )
@@ -280,10 +280,11 @@ def main_emnist_all_pairs():
     # --- 全てのペアが格納されているベースディレクトリを指定してください ---
     # 例: base_dir = "/path/to/your/data/" 
     # この下に pair1, pair2, ... がある想定
-    base_dir = "/workspace/alpha_test/emnist_digits/0.2/kyu_ver2_8/noise" # このパスはご自身の環境に合わせてください
+    base_dir = "/workspace/alpha_test/emnist_digits/0.2/kyu_ver2_8/no_noise" # このパスはご自身の環境に合わせてください
 
     # --- プロットしたいエポックのリストを指定してください ---
-    epochs_to_plot = [1, 5, 30, 50, 100, 200, 500, 1000]
+    # epochs_to_plot = [1, 5, 30, 50, 100, 200, 500, 1000]
+    epochs_to_plot = [1, 5, 27, 42, 55, 70, 120, 1000]
 
     # 'pair'で始まるディレクトリを検索
     pair_dirs = sorted([d for d in os.listdir(base_dir) if os.path.isdir(os.path.join(base_dir, d)) and d.startswith('pair')])
@@ -296,14 +297,14 @@ def main_emnist_all_pairs():
         for label_dir in label_dirs:
             target_dir = os.path.join(pair_path, label_dir)
             
-            output_filename = f"{pair_dir}_{label_dir}.pdf"
+            output_filename = f"{pair_dir}_{label_dir}.svg"
             
             print(f"処理中: {target_dir}")
             plot_multiple_epochs_grid_emnist(
                 data_dir=target_dir,
                 epochs=epochs_to_plot,
                 savefig=True,
-                show_legend=True,
+                show_legend=False,
                 save_filename=output_filename,
                 columns=4
             )

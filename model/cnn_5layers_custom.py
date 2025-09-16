@@ -2,9 +2,9 @@ import torch
 import torch.nn as nn
 
 class CNN5Layer_cus(nn.Module):
-    def __init__(self, in_channels=3, num_classes=10, width_multiplier=1, img_size=(32, 32)):
+    def __init__(self, in_channels=1, num_classes=10, width_multiplier=1, img_size=(32, 32)):
         super(CNN5Layer_cus, self).__init__()
-        self.conv1 = nn.Conv2d(in_channels, int(1 * width_multiplier), kernel_size=3, stride=1, padding=1)
+        self.conv1 = nn.Conv2d(1, int(1 * width_multiplier), kernel_size=3, stride=1, padding=1)
         self.relu1 = nn.ReLU()
         self.pool1 = nn.MaxPool2d(kernel_size=2, stride=2)
         

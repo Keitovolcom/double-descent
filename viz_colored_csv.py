@@ -33,6 +33,7 @@ def load_data(data_dir, targets='color'):
     
     return data
 
+
 def extract_digit_for_digit_mode(name):
     if len(name) == 0:
         raise ValueError("Directory name is empty.")
@@ -344,7 +345,7 @@ def main():
 
 def main_all_dirs():
     print("main_all_dirs")
-    base_dir = "/workspace/alpha_test/seed/width_4/lr_0.2_sigma_0/ori_closet_seed_42width4_cnn_5layers_distribution_colored_emnist_variance0_combined_lr0.01_batch256_epoch1000_LabelNoiseRate0.2_Optimsgd_Momentum0.0/no_noise_no_noise"
+    base_dir = "/workspace/alpha_test/seed/width_4/lr_0.2_sigma_0/ori_closet_seed_42width4_cnn_5layers_distribution_colored_emnist_variance0_combined_lr0.01_batch256_epoch1000_LabelNoiseRate0.2_Optimsgd_Momentum0.0/noise_no_noise"
     combined_epochs =[1,5,30,50,60,100,140,1000]
     # 第一階層のディレクトリを取得（1, 10, 11など）
     first_level_dirs = [d for d in os.listdir(base_dir) if os.path.isdir(os.path.join(base_dir, d))]
@@ -371,5 +372,5 @@ def main_all_dirs():
             )
 
 if __name__ == "__main__":
-    #main_all_dirs()
-    main()
+    main_all_dirs()
+    # main()

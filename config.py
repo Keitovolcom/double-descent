@@ -202,10 +202,9 @@ def parse_args_model_save():
     """
     arg_parser = argparse.ArgumentParser(description="PyTorch Training Script")
     
-    # Set seed
-    arg_parser.add_argument("-seed", "--fix_seed", type=int, default=42, help="Random seed for reproducibility")
     
     # Model settings
+    arg_parser.add_argument('--fix_seed', type=int, default=42, help='Seed for reproducibility')
     arg_parser.add_argument("--model", type=str, choices=[
         "cnn_2layers", "cnn_3layers", "cnn_4layers",
         "cnn_5layers", "cnn_8layers", "cnn_16layers", "resnet18","resnet18k","cnn_5layers_cus"
@@ -247,4 +246,10 @@ def parse_args_model_save():
     arg_parser.add_argument("-weight_noisy", "--weight_noisy", type=float, default=1.0, help="Weight for noisy samples")
     arg_parser.add_argument("-weight_clean", "--weight_clean", type=float, default=1.0, help="Weight for clean samples")
     arg_parser.add_argument('--use_saved_data', type=str2bool, default=True, help='Use pre-saved data') 
+    
+     # ▼▼▼▼▼【重要】Mixupの引数をここに追加します ▼▼▼▼▼
+    arg_parser.add_argument('--use_mixup', action='store_true', help='Use label-aware mixup for noisy samples')
+    arg_parser.add_argument('--mixup_alpha', type=float, default=1.0, help='Alpha parameter for beta distribution in mixup')
+    # ▲▲▲▲▲ ここまで ▲▲▲▲▲
+
     return arg_parser.parse_args()

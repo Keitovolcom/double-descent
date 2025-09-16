@@ -12,10 +12,70 @@ import matplotlib.pyplot as plt
 import sys
 from collections import defaultdict
 import os, glob, concurrent.futures
-plt.rcParams["font.size"] = 23
-plt.rcParams["figure.figsize"] = [12, 8]
+plt.rcParams["font.size"] = 35
+plt.rcParams["figure.figsize"] = [13, 8]
 plt.rcParams["figure.dpi"] = 400
-plt.rcParams['font.family'] = 'DejaVu Sans'
+plt.rcParams['font.family'] = 'Times New Roman'
+def parse_args_model_save_separate():
+    parser = argparse.ArgumentParser(description='PyTorch Training with Model Saving and Data Grouping')
+
+    # --- 基本設定 ---
+    parser.add_argument('--dataset', type=str, default='cifar10',
+                        help='Dataset to use (e.g., cifar10, distribution_colored_emnist)')
+    parser.add_argument('--target', type=str, default='digits',
+                        help='Target for the dataset (e.g., digits, colors, combined)')
+    parser.add_argument('--model', type=str, default='resnet18',
+                        help='Model architecture')
+    parser.add_argument('--model_width', type=int, default=64,
+                        help='Width of the model (e.g., for ResNet)')
+    parser.add_argument('--epoch', type=int, default=200,
+                        help='Number of training epochs')
+    parser.add_argument('--batch_size', type=int, default=128,
+                        help='Batch size for training and testing')
+    parser.add_argument('--lr', type=float, default=0.1,
+                        help='Learning rate')
+    parser.add_argument('--optimizer', type=str, default='sgd',
+                        help='Optimizer to use (sgd or adam)')
+    parser.add_argument('--momentum', type=float, default=0.9,
+                        help='Momentum for SGD optimizer')
+    parser.add_argument('--gpu', type=int, default=0,
+                        help='GPU ID to use')
+    parser.add_argument('--fix_seed', type=int, default=42,
+                        help='Seed for reproducibility')
+    parser.add_argument('--num_workers', type=int, default=2,
+                        help='Number of workers for DataLoader')
+
+    # --- ノイズ設定 ---
+    parser.add_argument('--label_noise_rate', type=float, default=0.0,
+                        help='Rate of label noise')
+    parser.add_argument('--variance', type=float, default=0.0,
+                        help='Variance for certain datasets')
+    parser.add_argument('--gray_scale', action='store_true',
+                        help='Convert images to grayscale')
+    parser.add_argument('--weight_noisy', type=float, default=1.0,
+                        help='Weight for noisy samples in loss calculation')
+    parser.add_argument('--weight_clean', type=float, default=1.0,
+                        help='Weight for clean samples in loss calculation')
+
+    # --- ログ設定 ---
+    parser.add_argument('--wandb', action='store_true',
+                        help='Enable Weights & Biases logging')
+    parser.add_argument('--project_name', type=str, default='pytorch-training',
+                        help='W&B project name')
+
+    # --- グループ分け機能の引数 ---
+    parser.add_argument('--group_data', action='store_true',
+                        help='If specified, run data grouping logic instead of training.')
+    parser.add_argument('--epoch_a', type=int, default=10,
+                        help='Reference epoch "a" for initial correctness check.')
+    parser.add_argument('--epoch_t', type=int, default=11,
+                        help='Start epoch "t" for the evaluation window.')
+    parser.add_argument('--epoch_k', type=int, default=50,
+                        help='End epoch "k" for the evaluation window.')
+
+    args = parser.parse_args()
+    return args
+
 def get_sample_dirs(base_dir: str) -> List[str]:
     """
     base_dir 以下の 2 階層下で "fig_and_log" を含むディレクトリを返す。
@@ -90,7 +150,7 @@ def compute_spatial_instability(
 
 def compute_temporal_instability(
     dfs: List[pd.DataFrame],
-    y_scale: Literal['ratio', 'percent', 'raw'] = 'ratio'
+    y_scale: Literal['ratio', 'percent', 'raw'] = 'raw'
 ) -> Dict[float, float]:
     """
     複数 epoch の df リストを受け取り、各 alpha ごとに変化回数を計算。
@@ -173,7 +233,7 @@ def evaluate_label_changes(
     pair_csv_dir: str,
     output_dir:   str,
     mode:         Literal['alpha','epoch'] = 'alpha',
-    y_scale:      Literal['ratio','percent','raw'] = 'ratio',
+    y_scale:      Literal['ratio','percent','raw'] = 'raw',
     epoch_start:  Optional[int] = None,
     epoch_end:    Optional[int] = None,
     plot:         bool = True
@@ -213,6 +273,7 @@ def evaluate_label_changes(
         return scores
 
     # mode == 'epoch'
+    print(y_scale)
     dfs = [pd.read_csv(fp) for _, fp in files]
     scores = compute_temporal_instability(dfs, y_scale)
     df_out = pd.DataFrame({'alpha': list(scores.keys()), 'unsmoothed_scores': list(scores.values())})
@@ -253,13 +314,13 @@ from pathlib import Path
 def aggregate_instability_across_samples(
     sample_dirs:  List[str],
     target:       str,
-    mode:         Literal['alpha','epoch'],
-    y_scale:      Literal['ratio','percent','raw'],
-    epoch_range:  Optional[Tuple[int,int]] = None
+    mode:         Literal['alpha', 'epoch'],
+    y_scale:      Literal['ratio', 'percent', 'raw'],
+    epoch_range:  Optional[Tuple[int, int]] = None
 ) -> pd.DataFrame:
     """
     各サンプルのスコア CSV を読み込み、x_value ごとの mean/std を返す DataFrame。
-    該当CSVが存在しない場合、mode=epochに限り自動的に再生成を試みる。
+    なければ mode==epoch のときに evaluate_label_changes で CSV を生成する。
     """
     # suffix
     suffix = ''
@@ -270,10 +331,12 @@ def aggregate_instability_across_samples(
     rows = []
     for d in sample_dirs:
         base = os.path.join(d, 'fig_and_log')
+
         if mode == 'alpha':
-            fname = f'label_change_scores_alpha.csv'
+            fname = f'label_change_scores_alpha.csv'   # suffix は alpha 側では使っていなかった
             x_col, y_col = 'epoch', 'label_change'
         elif mode == 'epoch':
+            # epoch_unsmoothed_scores_combined_epoch_1_to_1000
             fname = f'epoch_unsmoothed_scores{suffix}.csv'
             x_col, y_col = 'alpha', 'unsmoothed_scores'
         else:
@@ -281,22 +344,25 @@ def aggregate_instability_across_samples(
 
         fpath = os.path.join(base, fname)
 
-        if not os.path.exists(fpath) and mode == 'epoch':
-            print(f"[Info] {fpath} not found, regenerating from raw epoch files...")
+        # ========== フォールバック生成 ==========
+        if mode == 'epoch' and not os.path.exists(fpath):
+            print(f"[Info] {fpath} が存在しないため自動生成します…")
             try:
+                pair_csv_dir = os.path.join(d, 'csv')
                 evaluate_label_changes(
-                    pair_csv_dir=os.path.join(d, 'csv'),
+                    pair_csv_dir=pair_csv_dir,
                     output_dir=base,
                     mode='epoch',
                     y_scale=y_scale,
                     epoch_start=epoch_range[0] if epoch_range else None,
                     epoch_end=epoch_range[1] if epoch_range else None,
-                    plot=False
+                    plot=False     # ここでプロット不要なら False
                 )
             except Exception as e:
-                print(f"[Error] Failed to regenerate instability CSV for {d}: {e}")
-                continue  # skip this dir
+                print(f"[Warn] 生成に失敗 ({e}) : {pair_csv_dir}")
+                continue  # このサンプルは飛ばす
 
+        # ---------- 読み込み ----------
         if not os.path.exists(fpath):
             print(f"[Warn] missing {fpath}")
             continue
@@ -305,51 +371,232 @@ def aggregate_instability_across_samples(
         for _, row in df.iterrows():
             rows.append((row[x_col], row[y_col]))
 
+    # ---------- 集計 ----------
     if not rows:
-        print("[Error] No valid data rows found. Returning empty DataFrame.")
+        print("[Error] No valid instability data found.")
         return pd.DataFrame()
 
     df_all = pd.DataFrame(rows, columns=['x', 'score'])
-    stats = df_all.groupby('x')['score'].agg(['mean','std']).reset_index()
-    stats.rename(columns={'x':'x_value','mean':'mean_score','std':'std_score'}, inplace=True)
+    stats = (
+        df_all
+        .groupby('x')['score']
+        .agg(['mean', 'std'])
+        .reset_index()
+        .rename(columns={'x': 'x_value', 'mean': 'mean_score', 'std': 'std_score'})
+    )
     return stats
-
-
-def plot_aggregate_instability(
-    stats_df: pd.DataFrame,
-    xlabel:   str,
-    ylabel:   str,
-    save_path: str,
-    highlight: Optional[List[float]] = None,
-    log_scale_x: bool = False,
-    y_lim:    Optional[Tuple[float,float]] = None
+def plot_aggregate_temporal_instability(
+    stats_df:    pd.DataFrame,
+    xlabel:      str,
+    ylabel:      str,
+    save_path:   str,
+    *,
+    mode:        Literal["no_noise", "noise"] = "no_noise",
+    epoch_range: Optional[Tuple[int, int]]     = None,
+    highlight:   Optional[List[float]]         = None,
+    log_scale_x: bool                          = False,
+    y_lim:       Optional[Tuple[float, float]] = None,
+    marker_size: int                           = 15,
+    highlight_epochs=None,
+    abc=None # このパラメータを使用して動的な凡例を生成します
 ) -> None:
     """
-    aggregate_instability の結果をプロット保存。
+    aggregate_instability の結果をプロットして保存する。
+
+    Parameters
+    ----------
+    mode : {"no_noise", "noise"}
+        α=0,1 のマーカー色を切り替えるフラグ
+        "no_noise": α=0,1 とも青 / "noise": α=0 は青, α=1 は赤
+    epoch_range : (start, end), optional
+        xlabel == "alpha" の場合に y, std を
+        (end - start) で割って正規化するための区間
+    abc : list of tuples, optional
+        凡例に表示するTのサブスクリプトペア (例: [("A","C"), ("C","E")])
+        指定しない場合、または不正な形式の場合はデフォルトの"AC"が使用されます。
     """
-    fig, ax = plt.subplots(figsize=(8,5), dpi=300)
-    x = stats_df['x_value'].to_numpy()
-    y = stats_df['mean_score'].to_numpy()/100
-    std = stats_df['std_score'].to_numpy()/100
+
+    # ---------- main curve ----------
+    x   = stats_df["x_value"].to_numpy()
+
+    y   = stats_df["mean_score"].to_numpy()
+    std = stats_df["std_score"].to_numpy()
+
+    # xlabel = alpha のときだけ epoch_range で正規化
+    if xlabel.lower() == "alpha" and epoch_range is not None:
+        denom = max(epoch_range[1] - epoch_range[0], 1)  # ゼロ割防止
+        print(f"Normalization denominator: {denom}")
+        y   = y   / denom
+        std = std / denom
+    else:
+        y   = y / 200
+        std = std  / 100.0
+
+    fig, ax = plt.subplots(figsize=(8, 5), dpi=300)
+
     if highlight:
         for v in highlight:
-            ax.axvline(v, color='gray', linestyle='--')
-    ax.plot(x, y, linewidth=2, zorder=3,label="$INST_s(\\chi,t)$",color="blue")
-    ax.fill_between(x, y-std, y+std, alpha=0.2, zorder=2,color="blue")
-    ax.set_xlabel(xlabel)
-    ax.set_ylabel(ylabel)
+            ax.axvline(v, color="black", linestyle="-")
+
+    ax.plot(x, y, linewidth=2, zorder=3,
+             label=r'$INST_{\mathrm{T}}(\mathcal{T},x)$', color="blue")
+    ax.fill_between(x, y - std, y + std,
+                     alpha=0.2, zorder=2, color="blue")
+    if highlight_epochs:
+        for ep in highlight_epochs:
+            ax.axvline(x=ep, color='black', linestyle='-', linewidth=1.5, zorder=1)
+
+    # --- α = 0,1 の補助線 & マーカー、および動的なTラベル ---
+    if xlabel.lower() == "alpha":
+        # abcが提供されており、正しい形式のリストであることを確認
+        if abc and isinstance(abc, list) and all(isinstance(t, tuple) and len(t) == 2 for t in abc):
+            for p1, p2 in abc:
+                # epoch_rangeが指定されている場合のみ凡例に表示
+                if epoch_range is not None:
+                    ax.plot([], [], label=rf'$\mathcal{{T}}_{{{p1}{p2}}}$=[{epoch_range[0]},{epoch_range[1]}]', linewidth=0)
+                else:
+                    # epoch_rangeがない場合はシンプルな形式で表示
+                    ax.plot([], [], label=rf'$\mathcal{{T}}_{{{p1}{p2}}}$', linewidth=0)
+        else:
+            # abcが提供されていない、または不正な形式の場合のフォールバック
+            if epoch_range is not None:
+                # ax.plot([], [], label=rf'$\mathcal{{T}}_{{AC}}$=[{epoch_range[0]},{epoch_range[1]}]', linewidth=0)
+                ax.plot([], [], label=rf'$\mathcal{{T}}$=[{epoch_range[0]},{epoch_range[1]}]', linewidth=0)
+
+            else:
+                ax.plot([], [], label=rf'$\mathcal{{T}}$', linewidth=0)
+
+
+        ax.axvline(x=0.0, color='black', linestyle='-', linewidth=2, zorder=0)
+        ax.axvline(x=1.0, color='black', linestyle='-', linewidth=2, zorder=0)
+
+        if mode == "no_noise":
+            ax.plot([0.0, 1.0], [0.0, 0.0], "o",
+                     color="blue", markersize=marker_size, zorder=5)
+        else:  # mode == "noise"
+            ax.plot(0.0, 0.0, "o", color="blue",
+                     markersize=marker_size, zorder=5)
+            ax.plot(1.0, 0.0, "o", color="red",
+                     markersize=marker_size, zorder=5)
+
+    # ---------- aesthetics ----------
+    ax.set_ylabel(ylabel) # オリジナルでコメントアウトされていました
+    ax.set_xticks([0.0, 1.0])
+    ax.set_xticklabels([r'$x_{0}$', r'$x_{1}$'], fontsize=40)
+
     if y_lim:
         ax.set_ylim(y_lim)
     if log_scale_x:
-        ax.set_xscale('log')
+        ax.set_xscale("log")
     ax.legend()
     ax.grid(True)
     fig.tight_layout()
+
+    # ---------- save ----------
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
     fig.savefig(save_path)
     plt.close(fig)
     print(f"[✓] Aggregate plot saved to: {save_path}")
+def plot_aggregate_instability(
+    stats_df:   pd.DataFrame,
+    xlabel:     str,
+    ylabel:     str,
+    save_path:  str,
+    *,
+    mode:          Literal["no_noise", "noise"] = "no_noise",
+    epoch_range:   Optional[Tuple[int, int]]     = None,          # ← 追加
+    highlight:     Optional[List[float]]         = None,
+    log_scale_x:   bool                         = False,
+    y_lim:         Optional[Tuple[float, float]] = None,
+    marker_size:   int                          = 10,
+    highlight_epochs=None,
+) -> None:
+    """
+    aggregate_instability の結果をプロットして保存する。
 
+    Parameters
+    ----------
+    mode : {"no_noise", "noise"}
+        α=0,1 のマーカー色を切り替えるフラグ
+        "no_noise": α=0,1 とも青 / "noise": α=0 は青, α=1 は赤
+    epoch_range : (start, end), optional
+        xlabel == "alpha" の場合に y, std を
+        (end - start) で割って正規化するための区間
+    """
+
+    # ---------- main curve ----------
+    x   = stats_df["x_value"].to_numpy()
+
+    y   = stats_df["mean_score"].to_numpy()
+    std = stats_df["std_score"].to_numpy()
+
+    # xlabel = alpha のときだけ epoch_range で正規化
+    if xlabel.lower() == "alpha" and epoch_range is not None:
+        denom = max(epoch_range[1] - epoch_range[0], 1)  # ゼロ割防止
+        print(denom)
+        y   = y   / denom
+        std = std / denom
+    else:
+        # y   = y 
+        # std = std  
+        y   = y / 200
+        std = std /200
+    # fig, ax = plt.subplots(figsize=(8, 5), dpi=300)
+    
+    #miruの発表要
+    fig, ax = plt.subplots(figsize=(12, 7), dpi=300)
+    if highlight:
+        for v in highlight:
+            ax.axvline(v, color="black", linestyle="-")
+
+    ax.plot(x, y, linewidth=2, zorder=3,
+            label="$INST_s(\\chi,t)$", color="blue")
+    ax.fill_between(x, y - std, y + std,
+                    alpha=0.2, zorder=2, color="blue")
+    if highlight_epochs:
+        for ep in highlight_epochs:
+            ax.axvline(x=ep, color='black', linestyle='-', linewidth=1.5, zorder=1)
+    # ---------- α = 0,1 の補助線 & マーカー ----------
+    if xlabel.lower() == "alpha":
+        ax.axvline(0.0, color="gray", linestyle="--", linewidth=1)
+        ax.axvline(1.0, color="gray", linestyle="--", linewidth=1)
+
+        if mode == "no_noise":
+            ax.plot([0.0, 1.0], [0.0, 0.0], "o",
+                    color="blue", markersize=marker_size, zorder=5)
+        else:  # mode == "noise"
+            ax.plot(0.0, 0.0, "o", color="blue",
+                    markersize=marker_size, zorder=5)
+            ax.plot(1.0, 0.0, "o", color="red",
+                    markersize=marker_size, zorder=5)
+
+    # ---------- aesthetics ----------
+    ax.autoscale(False)   # 以後どんなアーティストを追加しても軸範囲は固定
+
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    print(y_lim)
+    ax.set_xlim(0.9,1000)
+    ax.set_yticks([0.0, 0.01])
+    if y_lim:
+        ax.set_ylim(y_lim)
+    if log_scale_x:
+        ax.set_xscale("log")
+    ax.set_ylim(-0.0001, 0.011)
+    ax.set_yticks([0.0, 0.01])
+    # ax.set_yticks([0.0, 0.02,0.04, 0.06, 0.08, 0.1])
+
+
+    
+    ax.legend()
+    ax.grid(True)
+    fig.tight_layout()
+
+    # ---------- save ----------
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    fig.savefig(save_path)
+    plt.close(fig)
+    print(f"[✓] Aggregate plot saved to: {save_path}")
 def append_cross_entropy_to_csv(
     csv_dir:      str,
     true_label:   int,
@@ -411,96 +658,129 @@ def save_label_change_to_csv_with_sample_dirs(base_root, widths, target_epoch, s
     df.to_csv(save_path, index=False)
     print(f"[✓] CSV saved to: {save_path}")
 
-def plot_mean_match_rates_per_epoch(base_dir, plot_save_path, csv_save_path):
+def plot_mean_std_match_rates_per_epoch(
+    base_dir: str,
+    plot_save_path: str,
+    csv_save_path: str,
+    *,
+    mode: Literal["noise", "no_noise"] = "noise"
+):
     """
-    指定フォルダ以下にある "epoch_*.csv" ファイルを探索し、
-    predicted_label がフォルダ名に含まれる数値 (num1, num2) と一致した割合を
-    各エポックごとに平均し、プロットおよびデータ保存を行う。
+    指定フォルダ以下の "epoch_*.csv" を探索し、一致率をエポックごとに集計。
+    全ペアの平均と標準偏差を計算し、プロットおよびデータ保存を行う。
 
     Parameters
     ----------
     base_dir : str
-        ペアごとのCSVファイルを格納しているベースディレクトリ
-        例: base_dir/pairXXX/num1_num2/csv/epoch_0.csv ... のような構造
-    
+        ペアごとのCSVファイルを格納しているベースディレクトリ。
+        (例: base_dir/pairXXX/num1_num2/csv/epoch_0.csv)
     plot_save_path : str
-        プロット画像の保存先パス
-    
+        プロット画像の保存先パス。
     csv_save_path : str
-        プロットに使用するデータを保存するCSVのパス
+        プロット用データを保存するCSVのパス。
+    mode : {"noise", "no_noise"}, default "noise"
+        - "noise": num1 (noisy) と num2 (clean) の両方を処理する。
+        - "no_noise": num2 (clean) のみ処理する。
     """
+    print(f"処理モード: {mode}")
+    print("データファイルの検索と集計を開始します...")
+    
+    search_pattern = os.path.join(base_dir, '**', 'epoch_*.csv')
+    file_paths = glob.glob(search_pattern, recursive=True)
 
-    # 各epochごとに、「数字1との一致数」「数字2との一致数」「全サンプル数」を保持
-    sum_matches_num1 = defaultdict(int)
-    sum_matches_num2 = defaultdict(int)
-    sum_samples = defaultdict(int)
+    results_list = []
+    path_pattern = re.compile(r'pair\d+[/\\](\d+)_(\d+)[/\\]csv[/\\]epoch_(\d+)\.csv')
 
-    # base_dir配下を探索
-    for root, dirs, files in os.walk(base_dir):
-        # epoch_*.csv だけを抽出
-        epoch_files = [f for f in files if f.startswith("epoch_") and f.endswith(".csv")]
-
-        # パスから pairXXX/num1_num2/csv の部分を取り出す
-        #   例: .../pair3/7_2/csv/ → num1=7, num2=2
-        match = re.search(r'pair\d+/(\d+)_(\d+)/csv', root)
+    for path in file_paths:
+        match = path_pattern.search(path)
         if not match:
             continue
-        num1 = int(match.group(1))
-        num2 = int(match.group(2))
+        
+        num1, num2, epoch = map(int, match.groups())
 
-        # epoch_* のファイルを順番に処理
-        for file in sorted(epoch_files):
-            epoch_match = re.match(r'epoch_(\d+)\.csv', file)
-            if not epoch_match:
-                continue
+        try:
+            df = pd.read_csv(path, usecols=['predicted_label'])
+        except (ValueError, FileNotFoundError) as e:
+            print(f"警告: {path} の読み込みに失敗しました。スキップします。エラー: {e}")
+            continue
+            
+        if df.empty:
+            continue
 
-            epoch = int(epoch_match.group(1))
-            csv_path = os.path.join(root, file)
+        total_samples = len(df)
+        
+        # num2 (clean label) は常に計算
+        rate_num2 = (df['predicted_label'] == num2).sum() / total_samples
+        record = {'epoch': epoch, 'rate_num2': rate_num2}
 
-            # 「predicted_label」列のみ取得してメモリ節約
-            df = pd.read_csv(csv_path, usecols=['predicted_label'])
-            predicted = df['predicted_label'].values
+        # "noise"モードの場合のみnum1 (noisy label) を計算
+        if mode == "noise":
+            rate_num1 = (df['predicted_label'] == num1).sum() / total_samples
+            record['rate_num1'] = rate_num1
+        
+        results_list.append(record)
+        
+    if not results_list:
+        print("警告: 対象となるデータが見つかりませんでした。処理を終了します。")
+        return
 
-            # num1, num2との一致数をそれぞれカウント
-            matches_num1 = np.count_nonzero(predicted == num1)
-            matches_num2 = np.count_nonzero(predicted == num2)
-
-            # 同じ epoch に対して合計していく
-            sum_matches_num1[epoch] += matches_num1
-            sum_matches_num2[epoch] += matches_num2
-            sum_samples[epoch]      += len(predicted)
-
-    # 各epochごとに平均一致率を計算し、プロット用データを作成
-    epochs = sorted(sum_matches_num1.keys())
-    results = []
-    for ep in epochs:
-        avg_rate_num1 = sum_matches_num1[ep] / sum_samples[ep]
-        avg_rate_num2 = sum_matches_num2[ep] / sum_samples[ep]
-        results.append([ep, avg_rate_num1, avg_rate_num2])
-
-    # DataFrame化して CSV 保存
-    result_df = pd.DataFrame(results, columns=['epoch', 'number1', 'number2'])
+    results_df = pd.DataFrame(results_list)
+    
+    # modeに応じて集計する内容を定義
+    agg_dict = {
+        'mean_rate2': ('rate_num2', 'mean'),
+        'std_rate2': ('rate_num2', 'std'),
+    }
+    if mode == "noise":
+        agg_dict.update({
+            'mean_rate1': ('rate_num1', 'mean'),
+            'std_rate1': ('rate_num1', 'std'),
+        })
+        
+    stats_df = results_df.groupby('epoch').agg(**agg_dict).reset_index()
+    stats_df = stats_df.fillna(0)
+    
+    # 💾 CSV 保存
     os.makedirs(os.path.dirname(csv_save_path), exist_ok=True)
-    result_df.to_csv(csv_save_path, index=False)
-    print(f"✅ データをCSVに保存しました: {csv_save_path}")
+    stats_df.to_csv(csv_save_path, index=False)
+    print(f"✅ 統計データをCSVに保存しました: {csv_save_path}")
 
-    # プロット
-    plt.figure(figsize=(8, 5))
-    plt.plot(result_df['epoch'], result_df['number1'], label='数字1との平均一致率')
-    plt.plot(result_df['epoch'], result_df['number2'], label='数字2との平均一致率')
-    plt.xlabel('Epoch')
-    plt.ylabel('一致率')
-    plt.title('Epochごとの平均一致率（全pair平均）')
-    plt.legend()
-    plt.grid(True)
-    plt.tight_layout()
+    # 📊 プロット
+    fig, ax = plt.subplots(figsize=(10, 6), dpi=150)
 
-    # 画像を保存
+    # number2 (clean label) のプロット (常に行う)
+    ax.plot(stats_df['epoch'], stats_df['mean_rate2'], label='clean label (mean)', color='royalblue')
+    ax.fill_between(
+        stats_df['epoch'],
+        stats_df['mean_rate2'] - stats_df['std_rate2'],
+        stats_df['mean_rate2'] + stats_df['std_rate2'],
+        alpha=0.2, color='royalblue', label='clean label (std dev)'
+    )
+
+    # "noise"モードの場合のみ number1 (noisy label) をプロット
+    if mode == "noise":
+        ax.plot(stats_df['epoch'], stats_df['mean_rate1'], label='noisy label (mean)', color='darkorange')
+        ax.fill_between(
+            stats_df['epoch'],
+            stats_df['mean_rate1'] - stats_df['std_rate1'],
+            stats_df['mean_rate1'] + stats_df['std_rate1'],
+            alpha=0.2, color='darkorange', label='noisy label (std dev)'
+        )
+    
+    ax.set_xlabel('Epoch')
+    ax.set_ylabel('Match Rate')
+    title = 'Epochごとの平均一致率（全ペア平均 ± 標準偏差）' if mode == "noise" else 'Epochごとの一致率 (Clean Label)'
+    ax.set_title(title)
+    ax.legend()
+    ax.grid(True, linestyle='--', alpha=0.6)
+    ax.set_ylim(0, 1)
+    fig.tight_layout()
+
+    # 🖼️ 画像を保存
     os.makedirs(os.path.dirname(plot_save_path), exist_ok=True)
     plt.savefig(plot_save_path)
-    plt.close()
+    plt.close(fig)
     print(f"✅ 図を保存しました: {plot_save_path}")
-
 def analyze_all_temporal_instability(base_root, widths, output_dir, target_row=None):
     """
     すべてのalphaに対して temporal instability を計算し、
@@ -640,7 +920,7 @@ def save_spatial_instability_epoch_summary(
     出力列：width, noise_mean, noise_std, no_noise_mean, no_noise_std
     """
     records = []
-
+    
     for width in widths:
         print(f"[Info] Processing width={width}...")
 
@@ -675,11 +955,159 @@ def save_spatial_instability_epoch_summary(
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     df_out.to_csv(output_path, index=False)
     print(f"[✓] Summary CSV saved to: {output_path}")
+# 代わりに `ax` を引数で受け取るように変更。
+def draw_on_ax_temporal_instability(
+    ax: plt.Axes,  # ★★★ 描画対象のaxを引数で受け取る ★★★
+    stats_df: pd.DataFrame,
+    xlabel: str,
+    *,
+    mode: Literal["no_noise", "noise"] = "no_noise",
+    epoch_range: Optional[Tuple[int, int]] = None,
+    log_scale_x: bool = False,
+    y_lim: Optional[Tuple[float, float]] = None,
+    marker_size: int = 15,
+    abc=None
+) -> None:
+    """与えられたaxオブジェクト上に、集計されたinstabilityの結果をプロットする。"""
+    
+    # --- データ準備と正規化 ---
+    x = stats_df["x_value"].to_numpy()
+    y = stats_df["mean_score"].to_numpy()
+    std = stats_df["std_score"].to_numpy()
+
+    if xlabel.lower() == "alpha" and epoch_range is not None:
+        denom = max(epoch_range[1] - epoch_range[0], 1)
+        y = y / denom
+        std = std / denom
+    else:
+        y = y / 100.0
+        std = std / 100.0
+
+    # --- 描画処理 (axに対して行う) ---
+    ax.plot(x, y, linewidth=2, zorder=3,
+            # label=r'$INST_{\mathrm{T}}(\mathcal{T},x)$', color="blue")
+            label=r'$INST_{T}(T,x)$', color="blue")
+    ax.fill_between(x, y - std, y + std,
+                    alpha=0.2, zorder=2, color="blue")
+
+    if xlabel.lower() == "alpha":
+        # 動的凡例の生成
+        if abc and isinstance(abc, list) and all(isinstance(t, tuple) and len(t) == 2 for t in abc):
+            for p1, p2 in abc:
+                if epoch_range is not None:
+                    ax.plot([], [], label=rf'$\mathcal{{T}}$=[{epoch_range[0]},{epoch_range[1]}]', linewidth=0)
+        # 補助線とマーカー
+        ax.axvline(x=0.0, color='black', linestyle='-', linewidth=2, zorder=0)
+        ax.axvline(x=1.0, color='black', linestyle='-', linewidth=2, zorder=0)
+
+        if mode == "no_noise":
+            ax.plot([0.0, 1.0], [0.0, 0.0], "o",
+                    color="blue", markersize=marker_size, zorder=5)
+        else:
+            ax.plot(0.0, 0.0, "o", color="blue",
+                    markersize=marker_size, zorder=5)
+            ax.plot(1.0, 0.0, "o", color="red",
+                    markersize=marker_size, zorder=5)
+
+    # --- 見た目の調整 (axに対して行う) ---
+    # ★★★ Y軸ラベルの設定は、呼び出し元で制御するためここでは行わない ★★★
+    ax.set_xticks([0.0, 1.0])
+    ax.set_xticklabels([r'$x_{0}$', r'$x_{1}$'], fontsize=40) # フォントサイズを調整
+
+    if y_lim:
+        ax.set_ylim(y_lim)
+    if log_scale_x:
+        ax.set_xscale("log")
+    # ax.legend()
+    ax.grid(True)
+    # ★★★ fig.tight_layout() や savefig, close はここでは行わない ★★★
+
+
+# ===== STEP 2: メインスクリプト =====
+
+# def main():
+#     # --- 初期設定 ---
+#     mode      = "noise"
+#     width     = 8
+#     base_root = f"alpha_test/cifar10/0.2/64/{mode}"
+#     save_dir  = "/workspace/vizualize/ACML/cifar"
+#     os.makedirs(save_dir, exist_ok=True)
+
+#     plot_configs = [
+#         {"epoch_range": (1, 30), "abc": [("A", "C")]},
+#         # {"epoch_range": (27, 42), "abc": [("C", "D")]},
+#         {"epoch_range": (30, 80), "abc": [("C", "E")]},
+#         {"epoch_range": (80, 4000), "abc": [("E", "G")]},
+#         # {"epoch_range": (120, 1000), "abc": [("G", "H")]},
+
+#     ]
+#     num_plots = len(plot_configs)
+#     sample_dirs = get_sample_dirs(base_root)
+
+#     # --- 連結グラフの準備 ---
+#     # Y軸を共有(`sharey=True`)してサブプロットを作成
+#     fig, axes = plt.subplots(1, num_plots, figsize=(6 * num_plots, 5), sharey=True, dpi=300)
+
+#     # --- 各設定でループ処理し、サブプロットに描画 ---
+#     for i, config in enumerate(plot_configs):
+#         ax = axes[i]  # 描画対象のサブプロットを取得
+
+#         epoch_s, epoch_end = config["epoch_range"]
+#         current_abc = config["abc"]
+
+#         print(f"[Info] Processing plot {i+1}/{num_plots}: Epoch range {epoch_s}-{epoch_end}")
+
+#         # データの集計
+#         stats_df = aggregate_instability_across_samples(
+#             sample_dirs = sample_dirs,
+#             target      = "combined",
+#             mode        = "epoch",
+#             y_scale     = "raw",
+#             epoch_range = (epoch_s, epoch_end),
+#         )
+
+#         # ★★★ STEP 1で作成した関数を呼び出し、現在のaxに描画 ★★★
+#         draw_on_ax_temporal_instability(
+#             ax=ax,
+#             stats_df=stats_df,
+#             xlabel="alpha",
+#             mode=mode,
+#             epoch_range=(epoch_s, epoch_end),
+#             y_lim=(-0.01, 0.63),
+#             abc=current_abc,
+#         )
+
+#         # サブプロットごとのタイトルを設定
+
+#         # ★★★ 一番左のプロット(i=0)にのみY軸ラベルを表示 ★★★
+#         if i == 0:
+#             ax.set_ylabel("Temporal Instability")
+
+#     # --- 全体のレイアウトを調整して保存 ---
+#     fig.tight_layout()  # プロット間の重なりを自動調整
+
+#     fname_base = f"temporal_instability_w{width}_{mode}_combined_horizontal"
+#     svg_path   = os.path.join(save_dir, f"{fname_base}.svg")
+#     pdf_path   = os.path.join(save_dir, f"{fname_base}.pdf")
+
+#     print(f"\nSaving combined plot to: {svg_path}")
+#     fig.savefig(svg_path)
+#     print(f"Saving combined plot to: {pdf_path}")
+#     fig.savefig(pdf_path)
+
+#     plt.close(fig) # メモリを解放
+#     print("\n[✓] Combined plot has been generated successfully.")
+
+
+# if __name__ == '__main__':
+#     main()
 
 
 
 
-if __name__ == '__main__':
+# if __name__ == '__main__':
+
+
 #     widths = [1, 2, 4, 8, 10, 12, 16, 32, 64]
 
 #     save_spatial_instability_epoch_summary(
@@ -689,45 +1117,294 @@ if __name__ == '__main__':
 #     target_epoch=4000,  # ここで任意のepochを指定
 #     output_path='alpha_test/cifar10/0.2/figure/spatial_inst_epoch4000_summary.csv'
 # )
-    mode="noise"
-    widths = [64]
-    for width in widths:
-        print(f"[Info] Processing width={width}...")
+import os
+from typing import List, Dict, Tuple, Optional
+import matplotlib.pyplot as plt
 
-        base_dir = f"alpha_test/emnist_digits/0.2/8/{mode}"
-        sample_dirs = get_sample_dirs(base_dir)
+import os
+from typing import List, Dict, Tuple, Optional
+import matplotlib.pyplot as plt
+
+import os
+from typing import List, Dict, Tuple, Optional
+import matplotlib.pyplot as plt
+
+def plot_temporal_instability_grid(
+    base_roots:   List[str],
+    plot_configs: List[Dict[str, object]],
+    *,
+    # --- 行ごとの mode --------------------------------------------------
+    default_mode: str                = "noise",
+    row_modes:    Optional[List[str]] = None,
+    # --- 描画オプション --------------------------------------------------
+    y_scale:    str              = "raw",
+    y_lim:      Optional[Tuple[float, float]] = (-0.01, 0.83),
+    marker_size:int              = 15,
+    col_space:  float            = 0.15,   # ★ 横方向の余白
+    row_space:  float            = 0.15,   # ★ 縦方向の余白
+    # --- ラベル・保存先 --------------------------------------------------
+    ylabel:     str              = "Temporal Instability",
+    xlabel:     str              = "alpha",
+    save_path:  str              = "./temporal_instability_grid.svg",
+) -> None:
+    """行=base_roots, 列=plot_configs のグリッド図を生成。"""
+
+    n_rows, n_cols = len(base_roots), len(plot_configs)
+    if n_rows == 0 or n_cols == 0:
+        raise ValueError("base_roots と plot_configs は空にできません")
+
+    # 行ごとの mode を決定
+    if row_modes is None:
+        row_modes = [default_mode] * n_rows
+    if len(row_modes) != n_rows:
+        raise ValueError("row_modes の長さが base_roots と一致しません")
+
+    # --------- Figure / Axes 生成（余白を gridspec_kw で指定） ----------
+    fig, axes = plt.subplots(
+        n_rows, n_cols,
+        figsize=(8 * n_cols, 5 * n_rows),
+        sharey=True,
+        dpi=300,
+        gridspec_kw={"wspace": col_space, "hspace": row_space},  # ★ここ★
+    )
+    # axes を 2 次元配列化
+    if n_rows == 1 and n_cols == 1:
+        axes = [[axes]]
+    elif n_rows == 1:
+        axes = [axes]
+    elif n_cols == 1:
+        axes = [[ax] for ax in axes]
+
+    # --------- 各セルを描画 --------------------------------------------
+    for r, (base_root, mode) in enumerate(zip(base_roots, row_modes)):
+        sample_dirs = get_sample_dirs(base_root)
+        if not sample_dirs:
+            print(f"[Warn] No samples under {base_root}");  continue
+
+        for c, cfg in enumerate(plot_configs):
+            ax          = axes[r][c]
+            epoch_s, epoch_e = cfg["epoch_range"]
+            abc_cfg     = cfg.get("abc")
+
+            stats_df = aggregate_instability_across_samples(
+                sample_dirs=sample_dirs,
+                target     ="combined",
+                mode       ="epoch",
+                y_scale    =y_scale,
+                epoch_range=(epoch_s, epoch_e),
+            )
+
+            draw_on_ax_temporal_instability(
+                ax          = ax,
+                stats_df    = stats_df,
+                xlabel      = xlabel,
+                mode        = mode,
+                epoch_range = (epoch_s, epoch_e),
+                y_lim       = y_lim,
+                marker_size = marker_size,
+                abc         = abc_cfg,
+            )
+
+            if c == 0:                # 左端にだけ Y ラベル
+                ax.set_ylabel(ylabel, fontsize=35)
+
+    # --------- 保存 ------------------------------------------------------
+    fig.tight_layout()
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    fig.savefig(save_path)
+    plt.close(fig)
+    print(f"[✓] Grid figure saved to: {save_path}")
+
+
+
+
+# --- 設定 --------------------------------------------------------------
+def temporal_gattai():
+    base_roots = [
+    "alpha_test/emnist_digits/0.2/128_kyu_ver2_8_random/no_noise",
+    "alpha_test/emnist_digits/0.2/128_kyu_ver2_8_random/noise"
+    ]
+
+    row_modes = [
+        "no_noise",  # 1 行目の mode
+        "noise",     # 2 行目の mode
+    ]
+
+    plot_configs = [
+        {"epoch_range": (1, 27),  "abc": None},
+        {"epoch_range": (27, 55), "abc": None},
+        {"epoch_range": (55,120), "abc": None},
+    ]
+
+    plot_temporal_instability_grid(
+        base_roots    = base_roots,
+        row_modes     = row_modes,      # 行ごとの mode
+        plot_configs  = plot_configs,
+        y_scale       = "raw",
+        y_lim         = (-0.01, 0.43),
+        marker_size=20,
+        col_space    = 0.05,   # 横をギュッと
+        row_space    = 0.2,   # 縦もギュッと
+        save_path     = "vizualize/miru_oral/temporal_instability_grid_2.svg",
+    )
+
+
+def temporal():    
+    mode      = "no_noise"          # "noise" or "no_noise"
+    width     = 64        # ディレクトリ階層で使う幅
+    # base_root = f"alpha_test/emnist_digits/0.2/kyu_ver2_8/{mode}"
+    # base_root = f"alpha_test/emnist_digits/0.2/{width}/{mode}"
+    save_dir  = "/workspace/vizualize/EMNIST_nosise0_2_64"
+    base_root = "alpha_test/emnist_digits/0.2/64/noiseis_correct_0_top100"
+    base_root = "alpha_test/emnist_digits/0.2/kyu_ver2_8_random/no_noise"
+    base_root = "alpha_test/emnist_digits/0.0/64/no_noise"
+    base_root = "alpha_test/emnist_digits/0.2/64_7_20/no_noise"
+
+
+    # alpha_test/emnist_digits/0.2/64_7_20/noise_random
+    # alpha_test/emnist_digits/0.2/64_7_20/noise_top100_select_sample
+    # print("[Info] Plotting mean match rates per epoch...")
+    # try:
+    #     plot_mean_std_match_rates_per_epoch(
+    #         base_dir=base_root,
+    #         plot_save_path=f"/workspace/vizualize/ACML/EMNIST/irekawari_no/match_{mode}.png",
+    #         csv_save_path=f"/workspace/vizualize/ACML/EMNIST/irekawari_no/match{mode}.csv",
+    #         mode=mode
+    #     )
+    # except Exception as e:
+    #     print(f"[Error] Failed to plot match rates: {e}")
+    # # 解析したい (start, end) のペアを好きなだけ並べる
+    # plot_configs = [
+    #     {"epoch_range": (0, 1000), "abc": [("A", "B")]}, # Example: new abc for this range
+    #     # {"epoch_range": (27, 42), "abc": [("B", "C")]},
+    #     # {"epoch_range": (42, 55), "abc": [("C", "D")]},
+    #     # {"epoch_range": (27, 55), "abc": [("C", "E")]},
+    #     # {"epoch_range": (55, 120), "abc": [("E", "G")]},
+    #     # {"epoch_range": (120, 1000), "abc": [("G", "H")]},
+    #     # Add more configurations as needed
+    # ]
+    # plot_configs = [
+    #     {"epoch_range": (1, 27), "abc": [("A", "B")]}, 
+    #     {"epoch_range": (27, 55), "abc": [("B", "C")]},
+    #     {"epoch_range": (55, 120), "abc": [("C", "D")]},
+    #     # {"epoch_range": (27, 55), "abc": [("C", "E")]},
+    #     # {"epoch_range": (55, 120), "abc": [("E", "G")]},
+    #     # {"epoch_range": (120, 1000), "abc": [("G", "H")]},
+    #     # Add more configurations as needed
+    # ]
+    # plot_configs = [
+    #     {"epoch_range": (1, 1000), "abc": None},
+    #     {"epoch_range": (27, 55), "abc": None},
+    #     {"epoch_range": (55, 120), "abc": None},
+    # ]
+    plot_configs = [
+        {"epoch_range": (1, 30), "abc": None},
+        {"epoch_range": (30, 53), "abc": None},
+        {"epoch_range": (53, 140), "abc": None},
+    ]
+    sample_dirs = get_sample_dirs(base_root)
+
+    for config in plot_configs:
+        epoch_s, epoch_end = config["epoch_range"]
+        current_abc = config["abc"] # Get the abc list for the current configuration
+
+        print(f"[Info] Epoch range {epoch_s}-{epoch_end} with abc: {current_abc}")
 
         stats_df = aggregate_instability_across_samples(
-            sample_dirs=sample_dirs,
-            target="combined",
-            mode="epoch",  # spatial instability
-            y_scale="ratio",
-            epoch_range=(0, 2000)
+            sample_dirs = sample_dirs,
+            target      = "combined",
+            mode        = "epoch",      # temporal instability
+            y_scale     = "raw",
+            epoch_range = (epoch_s, epoch_end),
         )
 
-        save_dir = "/workspace/vizualize/ACML/EMNIST"
-        save_path = os.path.join(save_dir, f"spatial_instability_width_8{mode}.svg")
-        save_path2=os.path.join(save_dir, f"spatial_instability_width_8{mode}.pdf")
-        plot_aggregate_instability(
-            stats_df=stats_df,
-            xlabel="Epoch",
-            ylabel="Spatial Instability",
-            save_path=save_path,
-            log_scale_x=True,
-            y_lim=(-0.001, 0.031)
-        )
-        plot_aggregate_instability(
-            stats_df=stats_df,
-            xlabel="Epoch",
-            ylabel="Spatial Instability",
-            save_path=save_path2,
-            log_scale_x=True,
-            y_lim=(-0.001, 0.031)
+        # Output file names embed the epoch range
+        fname_base = f"temporal_instability_w{width}_{mode}_{epoch_s}_{epoch_end}"
+        svg_path   = os.path.join(save_dir, f"{fname_base}_irekawari_top100.svg")
+        pdf_path   = os.path.join(save_dir, f"is_correct_0{fname_base}_irekawari.pdf")
 
+    #     # SVG plot
+        plot_aggregate_temporal_instability(
+            stats_df    = stats_df,
+            mode        = mode,
+            xlabel      = "alpha",
+            ylabel      = "Temporal Instability",
+            save_path   = svg_path,
+            log_scale_x = False,
+            epoch_range = (epoch_s, epoch_end),
+            y_lim       = (-0.01, 0.83),  # Specify y-axis range
+            abc         = current_abc,    # Pass the current abc list here!
         )
-        
-
+        # PDF plot
+        plot_aggregate_temporal_instability(
+            stats_df    = stats_df,
+            mode        = mode,
+            xlabel      = "alpha",
+            ylabel      = "Temporal Instability",
+            save_path   = pdf_path,
+            log_scale_x = False,
+            epoch_range = (epoch_s, epoch_end),
+            y_lim       = (-0.01, 0.83),  # Specify y-axis range
+            abc         = current_abc,    # Pass the current abc list here!
+        )
     
+    # epoch_s=0
+    # epoch_end=1000
+    
+    
+    # ----------------------------------------spatial------------------------------------
+def spatial():
+    mode      = "no_noise"          # "noise" or "no_noise"
+    width     = 64       # ディレクトリ階層で使う幅
+    base_root = f"alpha_test/emnist_digits/0.2/128_kyu_ver2_8_random/no_noise"
+    # base_root = f"alpha_test/emnist_digits/0.2/{width}/{mode}"
+    save_dir  = "vizualize/miru_oral"
+    # base_root = "alpha_test/emnist_digits/0.2/128_kyu_ver2_8_random/noise"
+    # base_root = "alpha_test/emnist_digits/0.2/64_7_20/noise_random"
+    sample_dirs = get_sample_dirs(base_root)
+
+    stats_df = aggregate_instability_across_samples(
+            sample_dirs = sample_dirs,
+            target      = "combined",
+            mode        = "alpha",      # temporal instability
+            y_scale     = "raw",
+            epoch_range = None,
+    )
+
+    svg_path = os.path.join(save_dir, f"spatial_instability_width_{width}{mode}_raw.svg")
+    pdf_path = os.path.join(save_dir, f"spatial_instability_width_{width}{mode}_raw.pdf")
+
+    # SVG 出力
+    plot_aggregate_instability(
+        stats_df    = stats_df,
+        xlabel      = "epoch",
+        ylabel      = "Spatial Instability",
+        save_path   = svg_path,
+        log_scale_x = True,
+        y_lim       = (-0.0001, 0.012),
+        highlight=[1,27,55,120]
+        # highlight=[30,80]
+        # highlight=[100]
+    )
+
+    # PDF 出力
+    plot_aggregate_instability(
+        stats_df    = stats_df,
+        xlabel      = "epoch",
+        ylabel      = "Spatial Instability",
+        save_path   = pdf_path,
+        log_scale_x = True,
+        # y_lim       = (-0.0001, 0.012),
+        highlight=[1,27,55,120]
+        # highlight=[30,80]
+        # highlight=[100]
+
+    )
+        
+if __name__ == '__main__':
+    # spatial()
+    #temporal()
+    temporal_gattai()
     
     
     # print("[Info] Analyzing temporal instability for all alpha values...")
@@ -741,15 +1418,15 @@ if __name__ == '__main__':
     # except Exception as e:
     #     print(f"[Error] Failed to analyze temporal instability: {e}")
 # if __name__ == '__main__':
-#     print("[Info] Plotting mean match rates per epoch...")
-#     try:
-#         plot_mean_match_rates_per_epoch(
-#             base_dir="/workspace/alpha_test/cifar10/0.2/64/noise",
-#             plot_save_path="/workspace/alpha_test/cifar10/0.2/64/noise/fig/match.png",
-#             csv_save_path="/workspace/alpha_test/cifar10/0.2/64/noise/fig/match.csv"
-#         )
-#     except Exception as e:
-#         print(f"[Error] Failed to plot match rates: {e}")
+    # print("[Info] Plotting mean match rates per epoch...")
+    # try:
+    #     plot_mean_match_rates_per_epoch(
+    #         base_dir="/workspace/alpha_test/cifar10/0.2/64/noise",
+    #         plot_save_path="/workspace/alpha_test/cifar10/0.2/64/noise/fig/match.png",
+    #         csv_save_path="/workspace/alpha_test/cifar10/0.2/64/noise/fig/match.csv"
+    #     )
+    # except Exception as e:
+    #     print(f"[Error] Failed to plot match rates: {e}")
 
 
 # if __name__ == '__main__':

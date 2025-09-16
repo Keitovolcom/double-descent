@@ -1,36 +1,22 @@
-#!/bin/bash
-
-# 実験設定（必要に応じて変更）
 SEED=42
-MODEL="cnn_5layers_cus"
+MODEL="resnet18k"
 MODEL_WIDTH=64
-DATASET="emnist_digits"
-LR=0.01
-BATCH_SIZE=128
-EPOCH=1000
-LABEL_NOISE_RATE=0.5
-OPTIMIZER="sgd"
+EPOCH=4000
+DATASET="cifar10"
+GRAY_SCALE=false
+BATCH=128
+LR=0.0001
+OPTIMIZER="adam"
 MOMENTUM=0.0
-GPU=0
-WEIGHT_NOISY=1.0
-WEIGHT_CLEAN=1.0
-NUM_WORKERS=4
 LOSS="cross_entropy"
-USE_SAVED_DATA=false
-
-# Mixup用設定
-USE_MIXUP=false      # Mixupを有効にする場合は true
-MIXUP_ALPHA=0.0     # Mixupのαパラメータ
-
-#-----------------カラー用-----------
-VARIANCE=0
-CORR=0.5
-#-----------------
+GPU=1
+NUM_WORKERS=4
 WANDB=true
 WANDB_PROJECT="kobayashi_save_model"
 WANDB_ENTITY="dsml-kernel24"
+USE_SAVE_DATA=false
+LABEL_NOISE_RATE=0.0
 
-# 引数を使ってPythonファイルを実行
 python dd_scratch_model_save.py \
   --fix_seed $SEED \
   --model $MODEL \
@@ -49,6 +35,4 @@ python dd_scratch_model_save.py \
   $(if $WANDB; then echo "--wandb"; fi) \
   $(if [ "$GRAY_SCALE" = true ]; then echo '--gray_scale'; fi) \
   --wandb_project $WANDB_PROJECT \
-  --wandb_entity $WANDB_ENTITY \
-  $(if [ "$USE_MIXUP" = true ]; then echo '--use_mixup'; fi) \
-  --mixup_alpha $MIXUP_ALPHA
+  --wandb_entity $WANDB_ENTITY

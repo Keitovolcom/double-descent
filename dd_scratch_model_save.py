@@ -228,12 +228,12 @@ def main():
         print('wandb is enabled' if args.wandb else 'wandb is disabled')
         if args.wandb:
             print('WandB is enabled')
-            experiment_name = f'test_seed_{args.fix_seed}width{args.model_width}_{args.model}_{args.dataset}_variance{args.variance}_{args.target}_lr{args.lr}_batch{args.batch_size}_epoch{args.epoch}_LabelNoiseRate{args.label_noise_rate}_Optim{args.optimizer}_Momentum{args.momentum}'
+            experiment_name = f'7_14_use_mixup_{args.use_mixup}_alpha{args.mixup_alpha}_test_seed_{args.fix_seed}width{args.model_width}_{args.model}_{args.dataset}_variance{args.variance}_{args.target}_lr{args.lr}_batch{args.batch_size}_epoch{args.epoch}_LabelNoiseRate{args.label_noise_rate}_Optim{args.optimizer}_Momentum{args.momentum}'
             wandb_run = setup_wandb(args, experiment_name) 
             # print('Initializing wandb...')
             # wandb_run = setup_wandb(args, experiment_name)
         else:
-            experiment_name = f'seed_{args.fix_seed}width{args.model_width}_{args.model}_{args.dataset}_variance{args.variance}_{args.target}_lr{args.lr}_batch{args.batch_size}_epoch{args.epoch}_LabelNoiseRate{args.label_noise_rate}_Optim{args.optimizer}_Momentum{args.momentum}'
+            experiment_name = f'7_14_use_mixup_{args.use_mixup}_alpha{args.mixup_alpha}_seed_{args.fix_seed}width{args.model_width}_{args.model}_{args.dataset}_variance{args.variance}_{args.target}_lr{args.lr}_batch{args.batch_size}_epoch{args.epoch}_LabelNoiseRate{args.label_noise_rate}_Optim{args.optimizer}_Momentum{args.momentum}'
 
         base_save_dir = f"save_model/{args.dataset}/noise_{args.label_noise_rate}/{experiment_name}"
         csv_path = os.path.join(base_save_dir, "csv", "training_metrics.csv")
@@ -344,15 +344,13 @@ def main():
 
                 # torch.save(save_dict, os.path.join(base_save_dir, f"model_epoch_{epoch}.pth"))
                 save_metrics(epoch, train_metrics, test_metrics, args, csv_path, wandb_run)
-                if epoch % 10 == 0:
-                    summary_log = (
+                summary_log = (
                         f"[Epoch {epoch}] "
                         f"TrainErr: {100 - train_metrics.get('train_accuracy', train_metrics.get('accuracy_total', 0)):.2f}% | "
                         f"CleanErr: {100 - train_metrics.get('train_accuracy_clean', train_metrics.get('accuracy_clean', 0)):.2f}% | "
                         f"NoisyErr: {100 - train_metrics.get('train_accuracy_noisy', train_metrics.get('accuracy_noisy', 0)):.2f}% || "
-                        f"TestErr: {test_metrics.get('test_error', 100 - test_metrics.get('test_accuracy', test_metrics.get('accuracy_total', 0))):.2f}%"
-                    )
-                    print(summary_log)
+                        f"TestErr: {test_metrics.get('test_error', 100 - test_metrics.get('test_accuracy', test_metrics.get('accuracy_total', 0))):.2f}%")
+                print(summary_log)
             except Exception as e:
                 print(f"Error in epoch {epoch}: {str(e)}")
                 continue

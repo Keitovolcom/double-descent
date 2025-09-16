@@ -60,7 +60,7 @@ def parse_args_save_clo():
         "mnist", "emnist", "emnist_digits", "cifar10", "cifar100",
         "tinyImageNet", "colored_emnist", "distribution_colored_emnist"
     ], default="cifar10", help="使用するデータセット")
-    parser.add_argument("-variance", "--variance", type=float, default=10000,
+    parser.add_argument("-variance", "--variance", type=int, default=10000,
                         help="分布データセット用の分散パラメータ")
     parser.add_argument("-correlation", "--correlation", type=float, default=0.5,
                         help="分布データセット用の相関パラメータ")
@@ -219,7 +219,7 @@ def evaluate_label_changes(
                 ax.set_ylim(y_lim)
             ax.set_xscale('log')
 
-            plot_path = os.path.join(save_dir, f"label_change_scores_alpha{epoch_suffix}_plot.pdf")
+            plot_path = os.path.join(save_dir, f"label_change_scores_alpha{epoch_suffix}_plot.svg")
             fig.savefig(plot_path, bbox_inches='tight')
             plt.close(fig)
             print(f"[✓] Alpha plot saved: {plot_path}")
@@ -265,7 +265,7 @@ def evaluate_label_changes(
             if y_lim:
                 ax.set_ylim(y_lim)
 
-            plot_path = os.path.join(save_dir, f"epoch_unsmoothed_scores{epoch_suffix}_plot.pdf")
+            plot_path = os.path.join(save_dir, f"epoch_unsmoothed_scores{epoch_suffix}_plot.svg")
             fig.savefig(plot_path, bbox_inches='tight')
             plt.close(fig)
             print(f"[✓] Epoch plot saved: {plot_path}")
@@ -281,7 +281,7 @@ def get_highlight_labels_from_path(data_dir):
     return label1, label2
 
 def generate_alpha_probabilities_gif(data_dir, output_path, targets='combined', epoch_stride=1,
-                                     start_epoch=1, end_epoch=140):
+                                     start_epoch=1, end_epoch=300):
     """
     指定した data_dir 内の epoch_*.csv を読み込み、alpha と予測確率の推移を GIF 保存する。
     ハイライトはディレクトリ名にあるラベル2つ（青・赤）に基づく。
@@ -460,111 +460,6 @@ def alpha_interpolation_test_save_combined_only(model, x_clean, x_noisy, label_x
         'raw_probabilities': output_probs.cpu().numpy().tolist(),
         'label_matches': label_matches.cpu().numpy().tolist()
     }
-def find_specific_pairs_from_csv(csv_path, x_train, noise_info, y_original_train,
-                                 distance_metric='euclidean',
-                                 mode='no_noise',
-                                 query_column_name='sample_index'):
-    """
-    CSVからクエリを読み込み、そのクエリと「同じラベル」を持つサンプルの中から、
-    modeで指定された種類（ノイズあり/なし）の最近傍ペアを探します。
-
-    Parameters:
-        csv_path (str): クエリとして使用するサンプルインデックスが記載されたCSVファイルのパス。
-        x_train (torch.Tensor): 学習サンプル画像 [N, C, H, W]。
-        noise_info (torch.Tensor): 各サンプルのノイズ情報（0: clean, 1: noisy）。
-        y_original_train (torch.Tensor): 元の正解ラベル [N]。
-        distance_metric (str): 距離計算の方法 ('euclidean', 'cosine', 'l1', 'linf')。
-        mode (str): ペアの2点目（マッチング相手）の種類を指定します。
-                    - 'no_noise': ノイズなし(clean)のサンプルの中から探します。
-                    - 'noise': ノイズあり(noisy)のサンプルの中から探します。
-        query_column_name (str): CSVファイル内のクエリインデックス列名。
-
-    Returns:
-        List[Dict]: 見つかった各ペアの情報（辞書型）を格納したリスト。
-    """
-    # --- セットアップ ---
-    print("find_specific_pairs")
-    device = x_train.device
-    N = x_train.size(0)
-    x_flat = x_train.view(N, -1)
-
-    # --- CSVからクエリインデックスを読み込み ---
-    try:
-        df = pd.read_csv(csv_path)
-        query_indices_selected = df[query_column_name].tolist()
-    except FileNotFoundError:
-        raise FileNotFoundError(f"CSVファイルが見つかりません: {csv_path}")
-
-    pairs = []
-    print(f"CSVから {len(query_indices_selected)} 件のクエリを読み込みました。ペア検索を開始します...")
-
-    # --- 各クエリに対してペアを検索 ---
-    for query_idx in query_indices_selected:
-        if not (0 <= query_idx < N):
-            print(f"警告: クエリインデックス {query_idx} は範囲外のため、スキップします。")
-            continue
-
-        query_idx_tensor = torch.tensor(query_idx, device=device)
-        query_label = y_original_train[query_idx_tensor].item()
-
-        # --- ★★★ ここがご要望のロジックです ★★★ ---
-        # 1. modeに応じて、ペアの2点目を探す候補全体のプールを決定
-        if mode == 'no_noise':
-            # 候補は「ノイズなし」のサンプル全体
-            candidate_pool = (noise_info == 0).nonzero(as_tuple=True)[0]
-        elif mode == 'noise':
-            # 候補は「ノイズあり」のサンプル全体
-            candidate_pool = (noise_info == 1).nonzero(as_tuple=True)[0]
-        else:
-            raise ValueError(f"不明なモードです: {mode} ('no_noise' または 'noise' を指定してください)")
-
-        # 2. 候補プールから、クエリと「同じラベル」を持つものだけに絞り込む
-        same_label_candidates = candidate_pool[y_original_train[candidate_pool] == query_label]
-
-        # 3. 絞り込んだ候補から、クエリ自身を除く
-        final_candidates = same_label_candidates[same_label_candidates != query_idx_tensor]
-        # -----------------------------------------
-
-        if len(final_candidates) == 0:
-            print(f"警告: クエリ {query_idx} (ラベル: {query_label}) に対し、mode='{mode}'の条件に合う候補が見つかりませんでした。")
-            continue
-
-        x_query = x_flat[query_idx_tensor]
-        x_candidates = x_flat[final_candidates]
-
-        # --- 距離計算 ---
-        # unsqueeze(0)は不要。x_queryの次元は[D], x_candidatesは[K, D]
-        if distance_metric == 'euclidean':
-            dists = torch.norm(x_query - x_candidates, p=2, dim=1)
-        elif distance_metric == 'cosine':
-            x_q_norm = torch.nn.functional.normalize(x_query.unsqueeze(0), p=2, dim=1)
-            x_c_norm = torch.nn.functional.normalize(x_candidates, p=2, dim=1)
-            dists = 1 - torch.matmul(x_q_norm, x_c_norm.T).squeeze(0)
-        elif distance_metric == 'l1':
-            dists = torch.norm(x_query - x_candidates, p=1, dim=1)
-        elif distance_metric == 'linf':
-            dists = torch.norm(x_query - x_candidates, p=float('inf'), dim=1)
-        else:
-            raise ValueError(f"不明な距離計量です: {distance_metric}")
-
-        # --- 最近傍のインデックスと距離を取得 ---
-        min_dist_val, min_idx_in_candidates = torch.min(dists, dim=0)
-        matched_idx = final_candidates[min_idx_in_candidates].item()
-        distance = min_dist_val.item()
-
-        # pairs.append({
-        #     "query_index": query_idx,
-        #     "matched_index": matched_idx,
-        #     "label": query_label,
-        #     "distance": distance
-        # })
-        pairs.append({
-            "matched_index": matched_idx,
-            "query_index": query_idx,
-            "label": query_label,
-            "distance": distance
-        })
-    return pairs
 def find_random_n_pairs_by_mode(x_train, noise_info, y_original_train, n,
                                  distance_metric='euclidean', mode='noise'):
     """
@@ -688,8 +583,8 @@ def save_pair_log(pairs, args):
     save_dir = Path("alpha_test") / args.dataset / str(args.label_noise_rate)
     save_dir.mkdir(parents=True, exist_ok=True)
 
-    save_path = save_dir / f"clean_s_epoch_correct_0_top100_{args.mode}_pairs.csv"
-    print("save",save_path)
+    save_path = save_dir / f"{args.mode}_selected_pairs.csv"
+
     rows = []
     for pair in pairs:
         rows.append({
@@ -705,7 +600,7 @@ def save_pair_log(pairs, args):
 def get_pair_save_dir(base_dir, args, pair_id, matched_label, query_label):
     pair_str = f"pair{pair_id}"
     sub_dir = f"{matched_label}_{query_label}"
-    csv_dir = Path(base_dir) / args.dataset / str(args.label_noise_rate) / str(args.model_width) / (args.mode + "is_correct_0_top100") / pair_str / sub_dir / "csv"
+    csv_dir = Path(base_dir) / args.dataset / str(args.label_noise_rate) / str(args.model_width) / args.mode / pair_str / sub_dir / "csv"
     fig_and_log_dir = csv_dir.parent / "fig_and_log"
     csv_dir.mkdir(parents=True, exist_ok=True)
     fig_and_log_dir.mkdir(parents=True, exist_ok=True)
@@ -771,9 +666,7 @@ def main():
                 raise ValueError("Dataset cannot be converted to TensorDataset.")
 
         x_original_train, y_original_train = train_dataset_original.tensors
-        # experiment_name = f'test_seed_{args.fix_seed}width{args.model_width}_{args.model}_{args.dataset}_variance{args.variance}_{args.target}_lr{args.lr}_batch{args.batch_size}_epoch{args.epoch}_LabelNoiseRate{args.label_noise_rate}_Optim{args.optimizer}_Momentum{args.momentum}'
-        # experiment_name = f'7_14_use_mixup_False_alpha0.0_test_seed_42width64_cnn_5layers_cus_emnist_digits_variance0_combined_lr0.01_batch128_epoch1000_LabelNoiseRate0.2_Optimsgd_Momentum0.0'
-        experiment_name = f'7_14_use_mixup_False_alpha0.0_test_seed_42width64_cnn_5layers_cus_emnist_digits_variance0_combined_lr0.01_batch128_epoch1000_LabelNoiseRate0.2_Optimsgd_Momentum0.0'
+        experiment_name = f'test_seed_{args.fix_seed}width{args.model_width}_{args.model}_{args.dataset}_variance{args.variance}_{args.target}_lr{args.lr}_batch{args.batch_size}_epoch{args.epoch}_LabelNoiseRate{args.label_noise_rate}_Optim{args.optimizer}_Momentum{args.momentum}'
 
         print('Creating noisy datasets...')
         train_dataset, test_dataset, meta = load_or_create_noisy_dataset(
@@ -783,6 +676,7 @@ def main():
         num_classes = meta["num_classes"]
         in_channels = meta["in_channels"]
         print("in_channels:", in_channels)
+
         if isinstance(train_dataset, NoisyDataset):
             print("NoisyDataset detected.")
             x_train_noisy, y_train_noisy = get_tensor_dataset_components(train_dataset)
@@ -792,49 +686,32 @@ def main():
             x_train_noisy, y_train_noisy = get_tensor_dataset_components(train_dataset)
             noise_info = get_noise_info(train_dataset)
 
-        print('Selecting sample pairs...')
-        # n_pairs = 100
-        # pairs = find_random_n_pairs_by_mode(
-        #     x_train_noisy, noise_info, y_original_train,
-        #     n=n_pairs,
-        #     distance_metric=args.distance_metric,
-        #     mode=args.mode
-        # )
-        # save_pair_log(pairs, args)
+        print('Loading saved pairs...')
+        all_pairs = load_saved_pairs_by_mode(args, base_dir="alpha_test")
+        if len(all_pairs) < 70:
+            raise ValueError("noise_selected_pairs.csv に70行目が存在しません。")
+        pairs = [all_pairs[68]]  # 70行目（index=69）のみ
 
-
-        pairs=find_specific_pairs_from_csv(
-            x_train=x_train_noisy, noise_info=noise_info, y_original_train=y_original_train,
-            distance_metric=args.distance_metric,
-            csv_path="save_model/emnist_digits/noise_0.2/7_14_use_mixup_False_alpha0.0_test_seed_42width64_cnn_5layers_cus_emnist_digits_variance0_combined_lr0.01_batch128_epoch1000_LabelNoiseRate0.2_Optimsgd_Momentum0.0/miscount_full_csv/clean_s_epoch_correct_0_top100.csv",
-            mode=args.mode
-        )
-        
-        save_pair_log(pairs, args)
-        # pairs = load_saved_pairs_by_mode(args, base_dir="alpha_test")
-
-        # save_pair_log(pairs, args)
-        print(f"{len(pairs)} pairs selected.")
         model = load_models(in_channels, args, imagesize, num_classes).to(device)
         base_save_dir = os.path.join("save_model", args.dataset, f"noise_{args.label_noise_rate}", experiment_name)
 
         for i, pair in enumerate(pairs):
-            # query_idx = pair["query_index"]
-            # matched_idx = pair["matched_index"]
-            query_idx = pair["matched_index"]
-            matched_idx = pair["query_index"]
+            query_idx = pair["query_index"]
+            matched_idx = pair["matched_index"]
             label = pair["label"]
             distance = pair["distance"]
-            print(f"\n[{i+1}/{len(pairs)}] Pair: query={query_idx}, matched={matched_idx}, label={label}, dist={distance:.4f}")
+            print(f"\n[Pair 70] query={query_idx}, matched={matched_idx}, label={label}, dist={distance:.4f}")
 
             x_query = x_train_noisy[query_idx]
+            print(f"x_query: min={x_query.min().item()}, max={x_query.max().item()}")
             x_matched = x_train_noisy[matched_idx]
             y_query = y_original_train[query_idx]
             y_matched = y_original_train[matched_idx]
+
             csv_dir, fig_and_log_dir = get_pair_save_dir(
                 base_dir="alpha_test",
                 args=args,
-                pair_id=i + 1,
+                pair_id=68,  # 固定で70番目として保存
                 matched_label=y_train_noisy[matched_idx].item(),
                 query_label=y_train_noisy[query_idx].item()
             )
@@ -842,45 +719,41 @@ def main():
             save_tensor_image(x_query, fig_and_log_dir / "query.png", dataset=args.dataset, clean_label=y_query.item(), noisy_label=y_train_noisy[query_idx].item())
             save_tensor_image(x_matched, fig_and_log_dir / "matched.png", dataset=args.dataset, clean_label=y_matched.item(), noisy_label=y_train_noisy[matched_idx].item())
 
-            for epoch in range(args.epoch + 2):
-                model_path = os.path.join(base_save_dir, f"model_epoch_{epoch}.pth")
-                if not os.path.exists(model_path):
-                    print(model_path)
-                    print(f"  [!] Skip epoch {epoch} (no model found)")
-                    continue
+            epoch = 1000  # 固定
+            model_path = os.path.join(base_save_dir, f"epoch_{epoch}.pth")
+            if not os.path.exists(model_path):
+                print(f"[!] Skip epoch {epoch} (no model found at {model_path})")
+                continue
 
-                checkpoint = torch.load(model_path, map_location=device)
-                if 'model_state_dict' in checkpoint:
-                    model.load_state_dict(checkpoint['model_state_dict'])
-                else:
-                    model.load_state_dict(checkpoint)
-                model.eval()
+            checkpoint = torch.load(model_path, map_location=device)
+            if 'model_state_dict' in checkpoint:
+                model.load_state_dict(checkpoint['model_state_dict'])
+            else:
+                model.load_state_dict(checkpoint)
+            model.eval()
 
-                result = alpha_interpolation_test_save_combined_only(
-                    model=model,
-                    x_clean=x_query,
-                    x_noisy=x_matched,
-                    label_x=y_query,
-                    label_y=y_matched,
-                    num_classes=num_classes,
-                    device=device
-                )
+            result = alpha_interpolation_test_save_combined_only(
+                model=model,
+                x_clean=x_query,
+                x_noisy=x_matched,
+                label_x=y_query,
+                label_y=y_matched,
+                num_classes=num_classes,
+                device=device
+            )
 
-                df = pd.DataFrame({
-                    'alpha': result['alpha_values'],
-                    'predicted_label': result['predicted_labels'],
-                    'label_match': result['label_matches'],
-                })
-                probs = pd.DataFrame(result['raw_probabilities'], columns=[f'prob_{i}' for i in range(num_classes)])
-                df = pd.concat([df, probs], axis=1)
+            df = pd.DataFrame({
+                'alpha': result['alpha_values'],
+                'predicted_label': result['predicted_labels'],
+                'label_match': result['label_matches'],
+            })
+            probs = pd.DataFrame(result['raw_probabilities'], columns=[f'prob_{i}' for i in range(num_classes)])
+            df = pd.concat([df, probs], axis=1)
 
-                csv_path = csv_dir / f"epoch_{epoch}.csv"
-                df.to_csv(csv_path, index=False)
+            csv_path = csv_dir / f"epoch_{epoch}.csv"
+            df.to_csv(csv_path, index=False)
+            print(f"[✓] Saved CSV to {csv_path}")
 
-            gif_path = fig_and_log_dir / "alpha_plot.gif"
-            generate_alpha_probabilities_gif(data_dir=csv_dir, output_path=str(gif_path))
-
-            # 評価の実行（raw指定）
             evaluate_label_changes(pair_csv_dir=str(csv_dir), output_dir=str(fig_and_log_dir), mode='alpha', y_lim=None, y_scale='raw', plot_result=True)
             evaluate_label_changes(pair_csv_dir=str(csv_dir), output_dir=str(fig_and_log_dir), mode='epoch', y_lim=None, y_scale='raw', plot_result=True)
 

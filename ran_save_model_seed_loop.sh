@@ -32,7 +32,7 @@ USE_SAVE_DATA=true  # 既に保存されたデータを使用するためにtrue
 WEIGHT_NOISY=1.0
 WEIGHT_CLEAN=1.0
 VAR=1000
-GPU=3
+GPU=
 # 単一のモデル、パラメータ設定で実行
 MODEL="cnn_5layers"
 LABEL_NOISE_RATE=0.0

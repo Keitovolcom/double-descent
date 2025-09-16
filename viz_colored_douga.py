@@ -95,94 +95,95 @@ def target_plot_probabilities(
     video_file_name = f"{parent_name}_{current_name}_{video_output}"
     video_output_path = os.path.join(save_dir, video_file_name)
     
-    highlight_targets = get_highlight_targets(data_dir, targets)
+    # --- 初回 epoch での predicted_label と label_match を取得 ---
+    initial_pred  = int(df_first['predicted_label'].iloc[0])
+    initial_match = bool(df_first['label_match'].iloc[0])
 
     # グラフ作成
     fig, ax = plt.subplots()
     plt.subplots_adjust(bottom=0.25)
     lines = []
-    alpha_values = df_first['alpha']
+    orig_styles = []
     other_colors = cycle([
         'green', 'orange', 'purple', 'brown', 
         'gray', 'pink', 'olive', 'cyan', 'lime', 'navy'
     ])
-    if targets == 'combined':
-        for t in range(100):
-            column_name = f'probability_{t}'
-            if column_name in df_first.columns:
-                if t == highlight_targets[0]:
-                    color = 'blue'
-                    linestyle = "-"
-                    linewidth = 2.0
-                    label = "Clean Label"
-                elif t == highlight_targets[1]:
-                    color = 'red'
-                    linestyle = "-"
-                    linewidth = 2.0
-                    label = "Noisy Label"
-                else:
-                    color = next(other_colors)
-                    linestyle = "--"
-                    linewidth = 1.0
-                    label = None
-                line, = ax.plot(alpha_values, df_first[column_name], 
-                                color=color, linestyle=linestyle, alpha=0.9, linewidth=linewidth, 
-                                label=label)
-                lines.append(line)
-    else:
-        for t in range(10):
-            column_name = f'{targets}_probability_{t}'
-            if column_name in df_first.columns:
-                if t in highlight_targets:
-                    color = 'blue' if t == highlight_targets[0] else 'red'
-                    label = "Clean Label" if t == highlight_targets[0] else "Noisy Label"
-                    line, = ax.plot(alpha_values, df_first[column_name], 
-                                    color=color, linewidth=2.0, label=label)
-                else:
-                    color = next(other_colors)
-                    line, = ax.plot(alpha_values, df_first[column_name], 
-                                    color=color, alpha=0.3, linewidth=0.5, label=None)
-                lines.append(line)
-    marker_size = 20
-    # マーカー描画（data_dir の文字列に基づく）
-    if "no_noise_no_noise" in data_dir:
-        ax.plot(0.0, 0.0, marker='o', color='blue', markersize=marker_size, zorder=5)
-        ax.plot(1.0, 0.0, marker='o', color='blue', markersize=marker_size, zorder=5)
-    elif "noise_no_noise" in data_dir:
-        ax.plot(0.0, 0.0, marker='o', color='blue', markersize=marker_size, zorder=5)
-        ax.plot(1.0, 0.0, marker='o', color='red', markersize=marker_size, zorder=5)
-    else:
-        ax.plot(0.0, 0.0, marker='o', color='blue', markersize=marker_size, zorder=5)
-        ax.plot(1.0, 0.0, marker='o', color='red', markersize=marker_size, zorder=5)
-    ax.axvline(x=0.0, color='grey', linestyle='-', linewidth=1.0)
-    ax.axvline(x=1.0, color='grey', linestyle='-', linewidth=1.0)
+
+    alpha_values = df_first['alpha']
+    # prob_0～prob_9 のループ
+    for t in range(10):
+        column_name = f'prob_{t}'
+        if column_name not in df_first.columns:
+            continue
+
+        if t == initial_pred:
+            # 正解なら青、誤りなら赤
+            color     = 'blue' if initial_match else 'red'
+            linestyle = '-'
+            linewidth = 2.0
+            label     = 'Correct Prediction' if initial_match else 'Incorrect Prediction'
+        else:
+            color     = next(other_colors)
+            linestyle = '--'
+            linewidth = 1.0
+            label     = None
+
+        line, = ax.plot(
+            alpha_values, df_first[column_name],
+            color=color,
+            linestyle=linestyle,
+            linewidth=linewidth,
+            label=label,
+            alpha=1.0
+        )
+        lines.append(line)
+        orig_styles.append((color, linestyle, linewidth, 1.0))
+
     ax.set_ylabel('Probability', fontsize=22)
-    # タイトルは blitting の対象外として通常更新
     ax.set_title(f'Probability for Epoch {initial_epoch}', fontsize=22)
     ax.set_ylim(-0.1, 1.1)
     ax.set_xticks([0.0, 1.0])
     ax.set_xticklabels([r'$x_0 \in X_C$', r'$x_1 \in X_C$'], fontsize=30)
     if show_legend:
-        clean_line = Line2D([0], [0], color='blue', linewidth=2.0, label='Clean Label')
-        noisy_line = Line2D([0], [0], color='red', linewidth=2.0, label='Noisy Label')
-        other_line = Line2D([0], [0], color='black', linestyle='--', linewidth=1.5, label='Others')
-        ax.legend(handles=[clean_line, noisy_line, other_line],
-                  loc="center left", bbox_to_anchor=(1.01, 0.5), borderaxespad=0, fontsize=16)
+        correct_line = Line2D([0], [0], color='blue', linewidth=2.0, label='Correct Prediction')
+        wrong_line   = Line2D([0], [0], color='red',  linewidth=2.0, label='Incorrect Prediction')
+        other_line   = Line2D([0], [0], color='black', linestyle='--', linewidth=1.5, label='Other Classes')
+        ax.legend(
+            handles=[correct_line, wrong_line, other_line],
+            loc="center left", bbox_to_anchor=(1.01, 0.5),
+            borderaxespad=0, fontsize=16
+        )
         fig.subplots_adjust(right=0.8)
 
-    # update 関数：ラインのみ blitting で更新；タイトルは各フレームで通常更新
+    # update 関数：各 epoch ごとに predicted_label／label_match を読み出してラインスタイルを更新
     def update(epoch):
         df_epoch = data[epoch]
+        pred  = int(df_epoch['predicted_label'].iloc[0])
+        match = bool(df_epoch['label_match'].iloc[0])
+
         for t, line in enumerate(lines):
-            column_name = f'probability_{t}' if targets == 'combined' else f'{targets}_probability_{t}'
-            if column_name in df_epoch.columns:
-                line.set_ydata(df_epoch[column_name])
+            column_name = f'prob_{t}'
+            # Y データは常に更新
+            line.set_ydata(df_epoch[column_name])
+
+            # ハイライト更新
+            if t == pred:
+                line.set_color('blue' if match else 'red')
+                line.set_linestyle('-')
+                line.set_linewidth(2.0)
+                line.set_alpha(1.0)
+            else:
+                orig_color, orig_ls, orig_lw, orig_alpha = orig_styles[t]
+                line.set_color(orig_color)
+                line.set_linestyle(orig_ls)
+                line.set_linewidth(orig_lw)
+                line.set_alpha(orig_alpha)
+
         return lines
 
-    # 初回描画後、背景キャッシュを作成（タイトルは blitting の対象外）
+    # Blitting の準備
     fig.canvas.draw()
     background = fig.canvas.copy_from_bbox(ax.bbox)
-
     width, height = fig.canvas.get_width_height()
     new_width, new_height = width // 2, height // 2
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
@@ -191,35 +192,32 @@ def target_plot_probabilities(
 
     for epoch in epochs:
         update(epoch)
-        # 背景キャッシュからラインのみ再描画
         fig.canvas.restore_region(background)
         for line in lines:
             ax.draw_artist(line)
         fig.canvas.blit(ax.bbox)
         fig.canvas.flush_events()
-        
-        # タイトルは通常更新（blitting の対象外）
+
         ax.set_title(f'Probability for Epoch {epoch}', fontsize=22)
         fig.canvas.draw_idle()
-        
-        # 1フレーム分の画像取得
+
         image = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
         image = image.reshape((height, width, 3))
         image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
         image_resized = cv2.resize(image, (new_width, new_height), interpolation=cv2.INTER_AREA)
         video_writer.write(image_resized)
-        
-        # 次フレームのため、再キャッシュ（ここは全体再描画でOK）
+
         fig.canvas.draw()
         background = fig.canvas.copy_from_bbox(ax.bbox)
-    
+
     video_writer.release()
     print(f"Video saved as {video_output_path}")
     plt.close(fig)
 
 def run_in_subprocess(d, save_dir):
     """
-    各ディレクトリごとに target_plot_probabilities を実行し、処理終了後にメモリ解放のためサブプロセスを利用。
+    各ディレクトリごとに target_plot_probabilities を実行し、
+    処理終了後にメモリ解放のためサブプロセスを利用。
     """
     target_plot_probabilities(
         data_dir=d,
@@ -233,67 +231,31 @@ def run_in_subprocess(d, save_dir):
         epoch_step=1
     )
 
-def main_1():
+def main(base_dir, save_dir=None):
     """
-    main_1：各ディレクトリごとにサブプロセスを作成して動画生成を行います。
+    base_dir 以下の各サブディレクトリ（それぞれに 'csv' フォルダがあるもの）を
+    全て処理して動画を生成します。
+    save_dir を指定すると、そこにまとめて出力。指定なければ各 data_dir/fig_and_log に出力。
     """
-    dirs=[
-        #"alpha_test/seed/width_4/lr_0.2_sigma_0/ori_closet_seed_42width4_cnn_5layers_distribution_colored_emnist_variance0_combined_lr0.01_batch256_epoch1000_LabelNoiseRate0.2_Optimsgd_Momentum0.0/no_noise_no_noise/94/94",
-        "alpha_test/seed/width_4/lr_0.2_sigma_0/ori_closet_seed_42width4_cnn_5layers_distribution_colored_emnist_variance0_combined_lr0.01_batch256_epoch1000_LabelNoiseRate0.2_Optimsgd_Momentum0.0/no_noise_no_noise/39/39",
-        "alpha_test/seed/width_4/lr_0.2_sigma_0/ori_closet_seed_42width4_cnn_5layers_distribution_colored_emnist_variance0_combined_lr0.01_batch256_epoch1000_LabelNoiseRate0.2_Optimsgd_Momentum0.0/no_noise_no_noise/80/80",
-        # "alpha_test/seed/width_4/lr_0.2_sigma_0/ori_closet_seed_42width4_cnn_5layers_distribution_colored_emnist_variance0_combined_lr0.01_batch256_epoch1000_LabelNoiseRate0.2_Optimsgd_Momentum0.0/no_noise_no_noise/67/67",
-
+    # 必要モジュールはファイルの先頭でインポート済み：os, glob
+    data_dirs = [
+        d for d in glob.glob(os.path.join(base_dir, "*"))
+        if os.path.isdir(d) and os.path.isdir(os.path.join(d, "csv"))
     ]
-    # dirs = [
-    #     "alpha_test/seed/width_4/lr_0.2_sigma_0/ori_closet_seed_42width4_cnn_5layers_distribution_colored_emnist_variance0_combined_lr0.01_batch256_epoch1000_LabelNoiseRate0.2_Optimsgd_Momentum0.0/noise_no_noise/59/88",
-    #     "alpha_test/seed/width_4/lr_0.2_sigma_0/ori_closet_seed_42width4_cnn_5layers_distribution_colored_emnist_variance0_combined_lr0.01_batch256_epoch1000_LabelNoiseRate0.2_Optimsgd_Momentum0.0/noise_no_noise/87/6",
-    #     "alpha_test/seed/width_4/lr_0.2_sigma_0/ori_closet_seed_42width4_cnn_5layers_distribution_colored_emnist_variance0_combined_lr0.01_batch256_epoch1000_LabelNoiseRate0.2_Optimsgd_Momentum0.0/noise_no_noise/36/9",
-    #     "alpha_test/seed/width_4/lr_0.2_sigma_0/ori_closet_seed_42width4_cnn_5layers_distribution_colored_emnist_variance0_combined_lr0.01_batch256_epoch1000_LabelNoiseRate0.2_Optimsgd_Momentum0.0/noise_no_noise/61/62",
-    #     "alpha_test/seed/width_4/lr_0.2_sigma_0/ori_closet_seed_42width4_cnn_5layers_distribution_colored_emnist_variance0_combined_lr0.01_batch256_epoch1000_LabelNoiseRate0.2_Optimsgd_Momentum0.0/noise_no_noise/92/45",
-    #     "alpha_test/seed/width_4/lr_0.2_sigma_0/ori_closet_seed_42width4_cnn_5layers_distribution_colored_emnist_variance0_combined_lr0.01_batch256_epoch1000_LabelNoiseRate0.2_Optimsgd_Momentum0.0/noise_no_noise/35/48",
-    #     "alpha_test/seed/width_4/lr_0.2_sigma_0/ori_closet_seed_42width4_cnn_5layers_distribution_colored_emnist_variance0_combined_lr0.01_batch256_epoch1000_LabelNoiseRate0.2_Optimsgd_Momentum0.0/noise_no_noise/39/17",
-    #     "alpha_test/seed/width_4/lr_0.2_sigma_0/ori_closet_seed_42width4_cnn_5layers_distribution_colored_emnist_variance0_combined_lr0.01_batch256_epoch1000_LabelNoiseRate0.2_Optimsgd_Momentum0.0/noise_no_noise/58/23",
-    #     "alpha_test/seed/width_4/lr_0.2_sigma_0/ori_closet_seed_42width4_cnn_5layers_distribution_colored_emnist_variance0_combined_lr0.01_batch256_epoch1000_LabelNoiseRate0.2_Optimsgd_Momentum0.0/noise_no_noise/11/40",
-    #     "alpha_test/seed/width_4/lr_0.2_sigma_0/ori_closet_seed_42width4_cnn_5layers_distribution_colored_emnist_variance0_combined_lr0.01_batch256_epoch1000_LabelNoiseRate0.2_Optimsgd_Momentum0.0/noise_no_noise/15/98"
-    # ]
-    #smalle
-    # dirs = [
-    #     "alpha_test/seed/width_4/lr_0.2_sigma_0/ori_closet_seed_42width4_cnn_5layers_distribution_colored_emnist_variance0_combined_lr0.01_batch256_epoch1000_LabelNoiseRate0.2_Optimsgd_Momentum0.0/noise_no_noise/11/40",
-    #     "alpha_test/seed/width_4/lr_0.2_sigma_0/ori_closet_seed_42width4_cnn_5layers_distribution_colored_emnist_variance0_combined_lr0.01_batch256_epoch1000_LabelNoiseRate0.2_Optimsgd_Momentum0.0/noise_no_noise/19/52",
-    #     "alpha_test/seed/width_4/lr_0.2_sigma_0/ori_closet_seed_42width4_cnn_5layers_distribution_colored_emnist_variance0_combined_lr0.01_batch256_epoch1000_LabelNoiseRate0.2_Optimsgd_Momentum0.0/noise_no_noise/91/23",
-    #     "alpha_test/seed/width_4/lr_0.2_sigma_0/ori_closet_seed_42width4_cnn_5layers_distribution_colored_emnist_variance0_combined_lr0.01_batch256_epoch1000_LabelNoiseRate0.2_Optimsgd_Momentum0.0/noise_no_noise/71/53",
-    #     "alpha_test/seed/width_4/lr_0.2_sigma_0/ori_closet_seed_42width4_cnn_5layers_distribution_colored_emnist_variance0_combined_lr0.01_batch256_epoch1000_LabelNoiseRate0.2_Optimsgd_Momentum0.0/noise_no_noise/1/12",
-    #     "alpha_test/seed/width_4/lr_0.2_sigma_0/ori_closet_seed_42width4_cnn_5layers_distribution_colored_emnist_variance0_combined_lr0.01_batch256_epoch1000_LabelNoiseRate0.2_Optimsgd_Momentum0.0/noise_no_noise/17/64",
-    #     "alpha_test/seed/width_4/lr_0.2_sigma_0/ori_closet_seed_42width4_cnn_5layers_distribution_colored_emnist_variance0_combined_lr0.01_batch256_epoch1000_LabelNoiseRate0.2_Optimsgd_Momentum0.0/noise_no_noise/16/7",
-    #     "alpha_test/seed/width_4/lr_0.2_sigma_0/ori_closet_seed_42width4_cnn_5layers_distribution_colored_emnist_variance0_combined_lr0.01_batch256_epoch1000_LabelNoiseRate0.2_Optimsgd_Momentum0.0/noise_no_noise/31/54",
-    #     "alpha_test/seed/width_4/lr_0.2_sigma_0/ori_closet_seed_42width4_cnn_5layers_distribution_colored_emnist_variance0_combined_lr0.01_batch256_epoch1000_LabelNoiseRate0.2_Optimsgd_Momentum0.0/noise_no_noise/13/78",
-    #     "alpha_test/seed/width_4/lr_0.2_sigma_0/ori_closet_seed_42width4_cnn_5layers_distribution_colored_emnist_variance0_combined_lr0.01_batch256_epoch1000_LabelNoiseRate0.2_Optimsgd_Momentum0.0/noise_no_noise/61/62"
-    # ]
-    #smalle
-    # dirs = [
-    #large
-    # dirs = [
-    # "alpha_test/seed/width_4/lr_0.2_sigma_0/ori_closet_seed_42width4_cnn_5layers_distribution_colored_emnist_variance0_combined_lr0.01_batch256_epoch1000_LabelNoiseRate0.2_Optimsgd_Momentum0.0/noise_no_noise/20/63",
-    # "alpha_test/seed/width_4/lr_0.2_sigma_0/ori_closet_seed_42width4_cnn_5layers_distribution_colored_emnist_variance0_combined_lr0.01_batch256_epoch1000_LabelNoiseRate0.2_Optimsgd_Momentum0.0/noise_no_noise/25/10",
-    # "alpha_test/seed/width_4/lr_0.2_sigma_0/ori_closet_seed_42width4_cnn_5layers_distribution_colored_emnist_variance0_combined_lr0.01_batch256_epoch1000_LabelNoiseRate0.2_Optimsgd_Momentum0.0/noise_no_noise/55/66",
-    # "alpha_test/seed/width_4/lr_0.2_sigma_0/ori_closet_seed_42width4_cnn_5layers_distribution_colored_emnist_variance0_combined_lr0.01_batch256_epoch1000_LabelNoiseRate0.2_Optimsgd_Momentum0.0/noise_no_noise/80/63",
-    # "alpha_test/seed/width_4/lr_0.2_sigma_0/ori_closet_seed_42width4_cnn_5layers_distribution_colored_emnist_variance0_combined_lr0.01_batch256_epoch1000_LabelNoiseRate0.2_Optimsgd_Momentum0.0/noise_no_noise/30/94",
-    # "alpha_test/seed/width_4/lr_0.2_sigma_0/ori_closet_seed_42width4_cnn_5layers_distribution_colored_emnist_variance0_combined_lr0.01_batch256_epoch1000_LabelNoiseRate0.2_Optimsgd_Momentum0.0/noise_no_noise/88/55",
-    # "alpha_test/seed/width_4/lr_0.2_sigma_0/ori_closet_seed_42width4_cnn_5layers_distribution_colored_emnist_variance0_combined_lr0.01_batch256_epoch1000_LabelNoiseRate0.2_Optimsgd_Momentum0.0/noise_no_noise/48/1",
-    # "alpha_test/seed/width_4/lr_0.2_sigma_0/ori_closet_seed_42width4_cnn_5layers_distribution_colored_emnist_variance0_combined_lr0.01_batch256_epoch1000_LabelNoiseRate0.2_Optimsgd_Momentum0.0/noise_no_noise/45/75",
-    # "alpha_test/seed/width_4/lr_0.2_sigma_0/ori_closet_seed_42width4_cnn_5layers_distribution_colored_emnist_variance0_combined_lr0.01_batch256_epoch1000_LabelNoiseRate0.2_Optimsgd_Momentum0.0/noise_no_noise/35/48",
-    # "alpha_test/seed/width_4/lr_0.2_sigma_0/ori_closet_seed_42width4_cnn_5layers_distribution_colored_emnist_variance0_combined_lr0.01_batch256_epoch1000_LabelNoiseRate0.2_Optimsgd_Momentum0.0/noise_no_noise/23/88"
-    #]  
-    save_dir = "/workspace/miru_vizualize/douga/C_C"
-    processes = []
-    for d in dirs:
-        print(f"Starting processing for: {d}")
-        p = Process(target=run_in_subprocess, args=(d, save_dir))
-        p.start()
-        processes.append(p)
-    for p in processes:
-        p.join()
-    print("All processes completed.")
+
+    for data_dir in sorted(data_dirs):
+        print(f"▶ Processing {data_dir}")
+        run_in_subprocess(data_dir, save_dir)
+
 
 if __name__ == "__main__":
-    main_1()
+    import sys
+
+    if len(sys.argv) < 2:
+        print("Usage: python script.py <base_dir> [save_dir]")
+        sys.exit(1)
+
+    base_dir = sys.argv[1]
+    save_dir = sys.argv[2] if len(sys.argv) >= 3 else None
+
+    main(base_dir, save_dir)
