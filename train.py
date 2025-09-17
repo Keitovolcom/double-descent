@@ -11,6 +11,7 @@ from sklearn.metrics import classification_report, accuracy_score
 from utils import clear_memory
 from datasets import compute_distances_between_indices  # Assuming it's moved here
 import math
+import torch.multiprocessing as mp
 
 
 #lossの計算だけ変更しよう。soft label化が必要ない
@@ -346,21 +347,21 @@ def train_model_standard(
         if idx_noisy.sum() > 0:
             loss_noisy = criterion_noisy(outputs[idx_noisy], labels[idx_noisy]) * weight_noisy
             loss_per_sample[idx_noisy] = loss_noisy
-            running_loss_noisy += loss_noisy.mean().item()
+            running_loss_noisy += loss_noisy.detach().sum().item()   # ★ meanではなくsumで蓄積
             correct_noisy += (predicted[idx_noisy] == labels[idx_noisy]).sum().item()
             total_noisy += idx_noisy.sum().item()
 
         if idx_clean.sum() > 0:
             loss_clean = criterion_clean(outputs[idx_clean], labels[idx_clean]) * weight_clean
             loss_per_sample[idx_clean] = loss_clean
-            running_loss_clean += loss_clean.mean().item()
+            running_loss_clean += loss_clean.detach().sum().item()    # ★ meanではなくsumで蓄積
             correct_clean += (predicted[idx_clean] == labels[idx_clean]).sum().item()
             total_clean += idx_clean.sum().item()
+
         if epoch_batch is not None and epoch_batch <= 3 and experiment_name is not None and args is not None:
-            
             save_dir = os.path.join(
-            "save_model", args.dataset, f"noise_{args.label_noise_rate}",
-            experiment_name, "csv", "batch_log", f"epoch_{epoch_batch}")
+                "save_model", args.dataset, f"noise_{args.label_noise_rate}",
+                experiment_name, "csv", "batch_log", f"epoch_{epoch_batch}")
             os.makedirs(save_dir, exist_ok=True)
             torch.save({
                 "inputs": inputs.detach().cpu(),
@@ -370,6 +371,7 @@ def train_model_standard(
                 "loss_per_sample": loss_per_sample.detach().cpu()
             }, os.path.join(save_dir, f"batch_{batch_idx}.pt"))
             batch_idx+=1
+
         loss = loss_per_sample.mean()
         loss.backward()
         optimizer.step()
@@ -400,7 +402,6 @@ def train_model_standard(
         "train_error_noisy": 100 - accuracy_noisy if total_noisy > 0 else float('nan'),
         "train_error_clean": 100 - accuracy_clean if total_clean > 0 else float('nan'),
     }
-    return metrics
 
 def train_model_distr_colored(model, train_loader, optimizer, criterion_noisy, criterion_clean,
                               weight_noisy, weight_clean, device, num_colors, num_digits):
@@ -554,7 +555,7 @@ def train_model_0_epoch_standard(model, train_loader, optimizer, criterion_noisy
                 loss_noisy = criterion_noisy(outputs_noisy, labels_noisy)
                 per_sample_loss[idx_noisy] = loss_noisy
 
-                running_loss_noisy += loss_noisy.mean().item()
+                running_loss_noisy += loss_noisy.sum().item()   # ★ meanではなくsumで蓄積
                 correct_noisy += (predicted[idx_noisy] == labels_noisy).sum().item()
                 total_noisy += idx_noisy.sum().item()
 
@@ -565,16 +566,15 @@ def train_model_0_epoch_standard(model, train_loader, optimizer, criterion_noisy
                 loss_clean = criterion_clean(outputs_clean, labels_clean)
                 per_sample_loss[idx_clean] = loss_clean
 
-                running_loss_clean += loss_clean.mean().item()
+                running_loss_clean += loss_clean.sum().item()    # ★ meanではなくsumで蓄積
                 correct_clean += (predicted[idx_clean] == labels_clean).sum().item()
                 total_clean += idx_clean.sum().item()
 
-            # 全体の平均損失
-            loss = per_sample_loss.mean()
-            running_loss += loss.item()
+            # 全体の合計損失（後でサンプル数で割る）
+            running_loss += per_sample_loss.sum().item()
 
     # 統計指標の計算
-    avg_loss = running_loss / len(train_loader)
+    avg_loss = running_loss / total_samples
     avg_loss_noisy = running_loss_noisy / total_noisy if total_noisy > 0 else float('nan')
     avg_loss_clean = running_loss_clean / total_clean if total_clean > 0 else float('nan')
     accuracy_total = 100. * correct_total / total_samples
@@ -601,7 +601,6 @@ def train_model_0_epoch_standard(model, train_loader, optimizer, criterion_noisy
         "train_error_noisy": error_noisy,
         "train_error_clean": error_clean
     }
-    return metrics
 # --- 修正後: train_model_0_epoch_distr_colored ---
 def train_model_0_epoch_distr_colored(model, train_loader, optimizer, criterion, weight_noisy, weight_clean, device, num_colors, num_digits):
     model.eval()
