@@ -14,3 +14,5 @@
 *.pdf
 *.txt
 *.png
+*.pth
+*.csv
