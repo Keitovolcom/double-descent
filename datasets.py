@@ -12,6 +12,7 @@ from torchvision import datasets
 import numpy as np
 import gzip
 import random
+from typing import Optional, Sequence, Union
 from utils import apply_transform
 
 def compute_distances_between_indices(train_dataset, clean_indices_groups, noisy_indices, mode=0, batch_size=1000):
@@ -472,6 +473,116 @@ def add_label_noise(targets, label_noise_rate, num_digits, num_colors):
             noise_info[idx] = 1  # Mark as noisy
 
     return noisy_targets, noise_info
+
+
+def add_targeted_label_noise(
+    targets: torch.Tensor,
+    total_noise_rate: float,
+    class_subset: Union[int, Sequence[int]],
+    num_classes: int = 10,
+    random_state: Optional[int] = None,
+):
+    """
+    Add label noise by restricting perturbations to a subset of classes while matching
+    a desired overall noise rate.
+
+    Args:
+        targets (torch.Tensor): 1D tensor of original labels.
+        total_noise_rate (float): Desired noisy proportion across the entire dataset (0.0〜1.0).
+        class_subset (Union[int, Sequence[int]]): Class ID or list of class IDs that are eligible
+            for label corruption.
+        num_classes (int): Total number of classes in the dataset.
+        random_state (Optional[int]): Seed for the internal RNG.
+
+        The function automatically computes the per-class corruption rate so that
+        `total_noise_rate` is achieved overall. For a balanced dataset, this matches
+        `total_noise_rate * num_classes / len(class_subset)`.
+
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor, dict]:
+            - noisy_targets: Tensor of labels after noise injection.
+            - noise_info: Tensor marking whether each sample was noised (1) or clean (0).
+            - meta: Dictionary with bookkeeping information such as achieved noise rates.
+    """
+    if targets.dim() != 1:
+        raise ValueError("targets must be a 1D tensor of class indices.")
+
+    if not 0.0 <= total_noise_rate <= 1.0:
+        raise ValueError("total_noise_rate must be within [0.0, 1.0].")
+
+    if isinstance(class_subset, int):
+        parsed_subset = [class_subset]
+    else:
+        parsed_subset = list(class_subset)
+
+    if len(parsed_subset) == 0:
+        raise ValueError("class_subset must contain at least one class index.")
+
+    unique_subset = sorted(set(int(cls) for cls in parsed_subset))
+    for cls in unique_subset:
+        if cls < 0 or cls >= num_classes:
+            raise ValueError(f"class ID {cls} is outside the valid range [0, {num_classes}).")
+
+    if num_classes < 2:
+        raise ValueError("num_classes must be at least 2 to apply label noise.")
+
+    total_samples = targets.numel()
+    desired_noisy = int(round(total_noise_rate * total_samples))
+
+    if desired_noisy == 0:
+        meta = {
+            "achieved_noise_rate": 0.0,
+            "per_class_noise_rate": 0.0,
+            "num_noisy_samples": 0,
+            "target_classes": unique_subset,
+        }
+        return targets.clone(), torch.zeros_like(targets, dtype=torch.long), meta
+
+    targets_cpu = targets.detach().cpu().clone()
+    mask = torch.zeros_like(targets_cpu, dtype=torch.bool)
+    for cls in unique_subset:
+        mask |= targets_cpu == cls
+    eligible_indices = torch.nonzero(mask, as_tuple=False).flatten()
+
+    eligible_count = int(eligible_indices.numel())
+    if eligible_count == 0:
+        raise ValueError("No samples belong to the specified class_subset.")
+
+    if desired_noisy > eligible_count:
+        raise ValueError(
+            f"Requested {desired_noisy} noisy samples but only {eligible_count} samples "
+            "belong to the specified class_subset."
+        )
+
+    rng = np.random.default_rng(random_state)
+    eligible_indices_np = eligible_indices.numpy()
+    rng.shuffle(eligible_indices_np)
+    selected_indices = eligible_indices_np[:desired_noisy]
+
+    noisy_targets_cpu = targets_cpu.clone()
+    noise_info_cpu = torch.zeros_like(targets_cpu, dtype=torch.long)
+
+    for idx in selected_indices:
+        idx = int(idx)
+        original_label = int(noisy_targets_cpu[idx].item())
+        rand_value = int(rng.integers(0, num_classes - 1))
+        if rand_value >= original_label:
+            rand_value += 1
+        noisy_targets_cpu[idx] = rand_value
+        noise_info_cpu[idx] = 1
+
+    noisy_targets = noisy_targets_cpu.to(targets.device, non_blocking=True)
+    noise_info = noise_info_cpu.to(targets.device, non_blocking=True)
+
+    achieved_noise_rate = desired_noisy / total_samples
+    per_class_noise_rate = desired_noisy / eligible_count
+    meta = {
+        "achieved_noise_rate": achieved_noise_rate,
+        "per_class_noise_rate": per_class_noise_rate,
+        "num_noisy_samples": desired_noisy,
+        "target_classes": unique_subset,
+    }
+    return noisy_targets, noise_info, meta
 
 
 def apply_label_noise_to_dataset(dataset, noise_rate, num_digits=10, num_colors=1):

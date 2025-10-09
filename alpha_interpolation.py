@@ -112,8 +112,20 @@ def parse_args_save_clo():
                         help="ペア選択モード")
     parser.add_argument("--distance_metric", type=str, choices=["euclidean", "cosine", "l1", "linf"],
                         default="cosine", help="距離計算のメトリック")
-    parser.add_argument("--num_pairs", type=int, default=1,
+    parser.add_argument("--num_pairs", type=int, default=100,
                         help="補間実験で選択するペア数")
+    parser.add_argument("--pair_source", type=str, choices=["csv", "random", "saved"],
+                        default="csv", help="ペアの取得方法を指定")
+    parser.add_argument("--pair_csv_path", nargs="+",
+                        help="クエリインデックスが含まれるCSVファイル（複数指定可、ワイルドカード可）")
+    parser.add_argument("--pair_csv_query_column", type=str, default="sample_index",
+                        help="CSV内でクエリインデックスを示す列名")
+    parser.add_argument("--pair_csv_limit", type=int, default=None,
+                        help="CSVから読み込むクエリ数の上限を指定（Noneの場合は全件）")
+    parser.add_argument("--pair_log_base_dir", type=str, default="alpha_test",
+                        help="ペアログを保存・読み込みする際のベースディレクトリ")
+    parser.add_argument("--pair_log_name", type=str, default=None,
+                        help="保存するペアログファイル名（拡張子不要）。未指定の場合は自動生成")
 
     return parser.parse_args()
 def evaluate_label_changes(
@@ -276,7 +288,7 @@ def get_highlight_labels_from_path(data_dir):
     """
     data_dir: 例 → alpha_test/cifar10/0.2/64/noise/pair0001/7_3/csv
     """
-    label_dir = os.path.basename(os.path.dirname(data_dir))  # "7_3"
+    label_dir = os.path.basename(os.path.dirname(data_dir))  # "7_3" 3がノイズ
     label1, label2 = map(int, label_dir.split("_"))
     return label1, label2
 
@@ -329,11 +341,12 @@ def generate_alpha_probabilities_gif(data_dir, output_path, targets='combined', 
         col = f'prob_{t}'
         if col in df_first.columns:
             if t == label1:
-                color = 'blue'
+                # color = 'blue'
+                color = 'red'
                 lw = 2.5
                 alpha = 1.0
             elif t == label2:
-                color = 'red'
+                color = 'blue'
                 lw = 2.5
                 alpha = 1.0
             else:
@@ -463,7 +476,8 @@ def alpha_interpolation_test_save_combined_only(model, x_clean, x_noisy, label_x
 def find_specific_pairs_from_csv(csv_path, x_train, noise_info, y_original_train,
                                  distance_metric='euclidean',
                                  mode='no_noise',
-                                 query_column_name='sample_index'):
+                                 query_column_name='sample_index',
+                                 max_pairs=None):
     """
     CSVからクエリを読み込み、そのクエリと「同じラベル」を持つサンプルの中から、
     modeで指定された種類（ノイズあり/なし）の最近傍ペアを探します。
@@ -552,18 +566,14 @@ def find_specific_pairs_from_csv(csv_path, x_train, noise_info, y_original_train
         matched_idx = final_candidates[min_idx_in_candidates].item()
         distance = min_dist_val.item()
 
-        # pairs.append({
-        #     "query_index": query_idx,
-        #     "matched_index": matched_idx,
-        #     "label": query_label,
-        #     "distance": distance
-        # })
         pairs.append({
-            "matched_index": matched_idx,
             "query_index": query_idx,
+            "matched_index": matched_idx,
             "label": query_label,
             "distance": distance
         })
+        if max_pairs is not None and len(pairs) >= max_pairs:
+            break
     return pairs
 def find_random_n_pairs_by_mode(x_train, noise_info, y_original_train, n,
                                  distance_metric='euclidean', mode='noise'):
@@ -637,16 +647,94 @@ def find_random_n_pairs_by_mode(x_train, noise_info, y_original_train, n,
         })
 
     return pairs
+def resolve_pair_log_path(args, base_dir="alpha_test", ensure_dir=False):
+    """
+    ペアログの保存/読込パスを返す。
+    """
+    mode_dir = Path(base_dir) / args.dataset / str(args.label_noise_rate) / str(args.model_width)/args.mode /"pair_log"
+    if ensure_dir:
+        mode_dir.mkdir(parents=True, exist_ok=True)
+
+    filename = args.pair_log_name or "selected_pairs"
+    if not filename.endswith(".csv"):
+        filename += ".csv"
+
+    return mode_dir / filename
+
+def collect_csv_files(path_inputs):
+    """
+    文字列で指定されたファイル/ディレクトリ/グロブからCSVファイルを収集する。
+    """
+    if not path_inputs:
+        return []
+
+    collected = []
+    for raw in path_inputs:
+        expanded = sorted(glob.glob(raw))
+        if not expanded:
+            expanded = [raw]
+
+        for item in expanded:
+            path = Path(item)
+            if path.is_dir():
+                csv_files = sorted(path.glob("*.csv"))
+                if not csv_files:
+                    print(f"[!] Directory has no CSV files: {path}")
+                collected.extend(csv_files)
+            elif path.exists():
+                collected.append(path)
+            else:
+                raise FileNotFoundError(f"CSVファイルまたはディレクトリが見つかりません: {item}")
+
+    unique_paths = []
+    seen = set()
+    for path in collected:
+        resolved = path.resolve()
+        if resolved not in seen:
+            unique_paths.append(path)
+            seen.add(resolved)
+    return unique_paths
+
+def load_pairs_from_csv_inputs(args, x_train, noise_info, y_original_train):
+    """
+    CSVからペアを読み込むユーティリティ。
+    """
+    csv_files = collect_csv_files(args.pair_csv_path)
+    if not csv_files:
+        raise FileNotFoundError("指定されたCSVファイルが見つかりませんでした。")
+
+    pairs = []
+    for csv_file in csv_files:
+        remaining = None
+        if args.pair_csv_limit is not None:
+            remaining = max(args.pair_csv_limit - len(pairs), 0)
+            if remaining == 0:
+                break
+        file_pairs = find_specific_pairs_from_csv(
+            csv_path=str(csv_file),
+            x_train=x_train,
+            noise_info=noise_info,
+            y_original_train=y_original_train,
+            distance_metric=args.distance_metric,
+            mode=args.mode,
+            query_column_name=args.pair_csv_query_column,
+            max_pairs=remaining
+        )
+        if file_pairs:
+            print(f"[✓] {csv_file} から {len(file_pairs)} 件のペアを取得しました。")
+        pairs.extend(file_pairs)
+    if args.pair_csv_limit is not None:
+        pairs = pairs[:args.pair_csv_limit]
+    return pairs
+
 def load_saved_pairs_by_mode(args, base_dir="alpha_test"):
     """
-    保存された *_selected_pairs.csv を読み込み、
-    find_random_n_pairs_by_mode() と同形式のペアリストを返す。
+    保存されたペアログを読み込み、find_random_n_pairs_by_mode() と同形式のペアリストを返す。
     
     Returns:
         pairs: list of dict with keys ['query_index', 'matched_index', 'label', 'distance']
     """
-    save_dir = Path(base_dir) / args.dataset / str(args.label_noise_rate)
-    csv_path = save_dir / f"{args.mode}_selected_pairs.csv"
+    csv_path = resolve_pair_log_path(args, base_dir=base_dir, ensure_dir=False)
 
     if not csv_path.exists():
         raise FileNotFoundError(f"[!] Saved pair file not found: {csv_path}")
@@ -670,7 +758,7 @@ def save_pair_log(pairs, args):
     選択したペア情報をCSVとして保存する。
 
     保存先:
-        alpha_test/{dataset}/{label_noise_rate}/{mode}_selected_pairs.csv
+        {pair_log_base_dir}/{dataset}/{label_noise_rate}/{mode}/pair_log/selected_pairs*.csv
 
     各行には：
         - query_index
@@ -682,14 +770,11 @@ def save_pair_log(pairs, args):
         pairs (list of dict): find_random_n_pairs_by_modeで得たペアリスト
         args (Namespace): 実験引数（dataset, label_noise_rate, mode を使用）
     """
-    import pandas as pd
-    from pathlib import Path
+    if not pairs:
+        print("[!] No pairs were generated. Pair log will not be saved.")
+        return None
 
-    save_dir = Path("alpha_test") / args.dataset / str(args.label_noise_rate)
-    save_dir.mkdir(parents=True, exist_ok=True)
-
-    save_path = save_dir / f"clean_s_epoch_correct_0_top100_{args.mode}_pairs.csv"
-    print("save",save_path)
+    save_path = resolve_pair_log_path(args, base_dir=args.pair_log_base_dir, ensure_dir=True)
     rows = []
     for pair in pairs:
         rows.append({
@@ -702,10 +787,46 @@ def save_pair_log(pairs, args):
     df = pd.DataFrame(rows)
     df.to_csv(save_path, index=False)
     print(f"[✓] Pair log saved to: {save_path}")
+    return save_path
+def select_pairs(args, x_train, noise_info, y_original_train):
+    """
+    CLI引数に基づいてペアを取得するメインユーティリティ。
+    """
+    if args.pair_source == "csv":
+        if not args.pair_csv_path:
+            raise ValueError("pair_source='csv' の場合は --pair_csv_path を指定してください。")
+        pairs = load_pairs_from_csv_inputs(
+            args=args,
+            x_train=x_train,
+            noise_info=noise_info,
+            y_original_train=y_original_train
+        )
+    elif args.pair_source == "random":
+        pairs = find_random_n_pairs_by_mode(
+            x_train=x_train,
+            noise_info=noise_info,
+            y_original_train=y_original_train,
+            n=args.num_pairs,
+            distance_metric=args.distance_metric,
+            mode=args.mode
+        )
+    elif args.pair_source == "saved":
+        pairs = load_saved_pairs_by_mode(
+            args=args,
+            base_dir=args.pair_log_base_dir
+        )
+    else:
+        raise ValueError(f"Unknown pair_source: {args.pair_source}")
+
+    if not pairs:
+        raise ValueError(f"pair_source='{args.pair_source}' でペアを取得できませんでした。条件を見直してください。")
+
+    print(f"[✓] 合計 {len(pairs)} 件のペアを取得しました。")
+    return pairs
 def get_pair_save_dir(base_dir, args, pair_id, matched_label, query_label):
     pair_str = f"pair{pair_id}"
     sub_dir = f"{matched_label}_{query_label}"
-    csv_dir = Path(base_dir) / args.dataset / str(args.label_noise_rate) / str(args.model_width) / (args.mode + "is_correct_0_top100") / pair_str / sub_dir / "csv"
+    csv_dir = Path(base_dir) / args.dataset / str(args.label_noise_rate) / str(args.model_width) / (args.mode) / pair_str / sub_dir / "csv"
     fig_and_log_dir = csv_dir.parent / "fig_and_log"
     csv_dir.mkdir(parents=True, exist_ok=True)
     fig_and_log_dir.mkdir(parents=True, exist_ok=True)
@@ -773,7 +894,7 @@ def main():
         x_original_train, y_original_train = train_dataset_original.tensors
         # experiment_name = f'test_seed_{args.fix_seed}width{args.model_width}_{args.model}_{args.dataset}_variance{args.variance}_{args.target}_lr{args.lr}_batch{args.batch_size}_epoch{args.epoch}_LabelNoiseRate{args.label_noise_rate}_Optim{args.optimizer}_Momentum{args.momentum}'
         # experiment_name = f'7_14_use_mixup_False_alpha0.0_test_seed_42width64_cnn_5layers_cus_emnist_digits_variance0_combined_lr0.01_batch128_epoch1000_LabelNoiseRate0.2_Optimsgd_Momentum0.0'
-        experiment_name = f'7_14_use_mixup_False_alpha0.0_test_seed_42width64_cnn_5layers_cus_emnist_digits_variance0_combined_lr0.01_batch128_epoch1000_LabelNoiseRate0.2_Optimsgd_Momentum0.0'
+        experiment_name = f'seed_{args.fix_seed}width{args.model_width}_{args.model}_{args.dataset}_variance{args.variance}_{args.target}_lr{args.lr}_batch{args.batch_size}_epoch{args.epoch}_LabelNoiseRate{args.label_noise_rate}_Optim{args.optimizer}_Momentum{args.momentum}'
 
         print('Creating noisy datasets...')
         train_dataset, test_dataset, meta = load_or_create_noisy_dataset(
@@ -793,36 +914,19 @@ def main():
             noise_info = get_noise_info(train_dataset)
 
         print('Selecting sample pairs...')
-        # n_pairs = 100
-        # pairs = find_random_n_pairs_by_mode(
-        #     x_train_noisy, noise_info, y_original_train,
-        #     n=n_pairs,
-        #     distance_metric=args.distance_metric,
-        #     mode=args.mode
-        # )
-        # save_pair_log(pairs, args)
-
-
-        pairs=find_specific_pairs_from_csv(
-            x_train=x_train_noisy, noise_info=noise_info, y_original_train=y_original_train,
-            distance_metric=args.distance_metric,
-            csv_path="save_model/emnist_digits/noise_0.2/7_14_use_mixup_False_alpha0.0_test_seed_42width64_cnn_5layers_cus_emnist_digits_variance0_combined_lr0.01_batch128_epoch1000_LabelNoiseRate0.2_Optimsgd_Momentum0.0/miscount_full_csv/clean_s_epoch_correct_0_top100.csv",
-            mode=args.mode
+        pairs = select_pairs(
+            args=args,
+            x_train=x_train_noisy,
+            noise_info=noise_info,
+            y_original_train=y_original_train
         )
-        
         save_pair_log(pairs, args)
-        # pairs = load_saved_pairs_by_mode(args, base_dir="alpha_test")
-
-        # save_pair_log(pairs, args)
-        print(f"{len(pairs)} pairs selected.")
         model = load_models(in_channels, args, imagesize, num_classes).to(device)
         base_save_dir = os.path.join("save_model", args.dataset, f"noise_{args.label_noise_rate}", experiment_name)
 
         for i, pair in enumerate(pairs):
-            # query_idx = pair["query_index"]
-            # matched_idx = pair["matched_index"]
-            query_idx = pair["matched_index"]
-            matched_idx = pair["query_index"]
+            query_idx = pair["query_index"]
+            matched_idx = pair["matched_index"]
             label = pair["label"]
             distance = pair["distance"]
             print(f"\n[{i+1}/{len(pairs)}] Pair: query={query_idx}, matched={matched_idx}, label={label}, dist={distance:.4f}")
@@ -839,8 +943,22 @@ def main():
                 query_label=y_train_noisy[query_idx].item()
             )
 
-            save_tensor_image(x_query, fig_and_log_dir / "query.png", dataset=args.dataset, clean_label=y_query.item(), noisy_label=y_train_noisy[query_idx].item())
-            save_tensor_image(x_matched, fig_and_log_dir / "matched.png", dataset=args.dataset, clean_label=y_matched.item(), noisy_label=y_train_noisy[matched_idx].item())
+            query_img_name = f"query_idx{query_idx}.png"
+            matched_img_name = f"matched_idx{matched_idx}.png"
+            save_tensor_image(
+                x_query,
+                fig_and_log_dir / query_img_name,
+                dataset=args.dataset,
+                clean_label=y_query.item(),
+                noisy_label=y_train_noisy[query_idx].item()
+            )
+            save_tensor_image(
+                x_matched,
+                fig_and_log_dir / matched_img_name,
+                dataset=args.dataset,
+                clean_label=y_matched.item(),
+                noisy_label=y_train_noisy[matched_idx].item()
+            )
 
             for epoch in range(args.epoch + 2):
                 model_path = os.path.join(base_save_dir, f"model_epoch_{epoch}.pth")
