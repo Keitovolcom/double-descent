@@ -1,6 +1,7 @@
 # datasets.py
 
 import os
+import json
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -12,76 +13,289 @@ from torchvision import datasets
 import numpy as np
 import gzip
 import random
+import tarfile
 from typing import Optional, Sequence, Union
 from utils import apply_transform
 
-def compute_distances_between_indices(train_dataset, clean_indices_groups, noisy_indices, mode=0, batch_size=1000):
-    """
-    Compute pairwise distances between clean and noisy indices using GPU acceleration.
+DATASET_NORMALIZATION_STATS = {
+    "cifar10": {
+        "mean": (0.4914, 0.4822, 0.4465),
+        "std": (0.2023, 0.1994, 0.2010),
+    },
+    "cifar100": {
+        "mean": (0.5071, 0.4867, 0.4408),
+        "std": (0.2675, 0.2565, 0.2761),
+    },
+    "emnist_digits": {
+        "mean": (0.1307,),
+        "std": (0.3081,),
+    },
+}
 
-    Args:
-        train_dataset (Dataset): The dataset containing the images.
-        clean_indices_groups (list of list): Groups of clean indices to compare against noisy indices.
-        noisy_indices (list): List of noisy indices to compare.
-        mode (int): Mode to determine the type of distance to find. 0 for closest, 1 for farthest.
-        batch_size (int): Batch size for distance calculation to optimize GPU memory usage.
+DEFAULT_TRANSFORM_SPECS = {
+    "cifar10": {
+        "train": [
+            {"name": "RandomCrop", "params": {"size": 32, "padding": 4}},
+            {"name": "RandomHorizontalFlip", "params": {}},
+            {"name": "Normalize", "params": {"mean": DATASET_NORMALIZATION_STATS["cifar10"]["mean"],
+                                             "std": DATASET_NORMALIZATION_STATS["cifar10"]["std"]}},
+        ],
+        "test": [
+            {"name": "Normalize", "params": {"mean": DATASET_NORMALIZATION_STATS["cifar10"]["mean"],
+                                             "std": DATASET_NORMALIZATION_STATS["cifar10"]["std"]}},
+        ],
+    },
+    "cifar100": {
+        "train": [
+            {"name": "RandomCrop", "params": {"size": 32, "padding": 4}},
+            {"name": "RandomHorizontalFlip", "params": {}},
+            {"name": "Normalize", "params": {"mean": DATASET_NORMALIZATION_STATS["cifar100"]["mean"],
+                                             "std": DATASET_NORMALIZATION_STATS["cifar100"]["std"]}},
+        ],
+        "test": [
+            {"name": "Normalize", "params": {"mean": DATASET_NORMALIZATION_STATS["cifar100"]["mean"],
+                                             "std": DATASET_NORMALIZATION_STATS["cifar100"]["std"]}},
+        ],
+    },
+    "emnist_digits": {
+        "train": [
+            {"name": "Resize", "params": {"size": 32}},
+            {"name": "Normalize", "params": {"mean": DATASET_NORMALIZATION_STATS["emnist_digits"]["mean"],
+                                             "std": DATASET_NORMALIZATION_STATS["emnist_digits"]["std"]}},
+        ],
+        "test": [
+            {"name": "Resize", "params": {"size": 32}},
+            {"name": "Normalize", "params": {"mean": DATASET_NORMALIZATION_STATS["emnist_digits"]["mean"],
+                                             "std": DATASET_NORMALIZATION_STATS["emnist_digits"]["std"]}},
+        ],
+    },
+}
 
-    Returns:
-        dict: Dictionary containing distances for each clean index group.
-    """
-    if mode not in (0, 1):
-        raise ValueError("mode must be 0 (closest) or 1 (farthest)")
+TRANSFORM_REGISTRY = {
+    "RandomCrop": transforms.RandomCrop,
+    "RandomHorizontalFlip": transforms.RandomHorizontalFlip,
+    "RandomRotation": transforms.RandomRotation,
+    "ColorJitter": transforms.ColorJitter,
+    "GaussianBlur": transforms.GaussianBlur,
+    "Normalize": transforms.Normalize,
+    "Resize": transforms.Resize,
+    "CenterCrop": transforms.CenterCrop,
+    "RandomResizedCrop": transforms.RandomResizedCrop,
+    "Grayscale": transforms.Grayscale,
+}
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    distances_results = {}
+def _describe_transform(transform) -> str:
+    if transform is None:
+        return "None"
+    if isinstance(transform, transforms.Compose):
+        return " -> ".join(type(t).__name__ for t in transform.transforms)
+    return type(transform).__name__
 
-    # Moving noisy images to GPU in batches for efficiency
-    noisy_imgs_batches = []
-    for i in range(0, len(noisy_indices), batch_size):
-        batch_indices = noisy_indices[i:i+batch_size]
-        noisy_imgs_batches.append(torch.stack([train_dataset[int(idx)][0] for idx in batch_indices]).to(device))
 
-    # Calculating distances for each group of clean indices
-    for clean_indices in clean_indices_groups:
-        clean_imgs = torch.stack([train_dataset[int(idx)][0] for idx in clean_indices]).to(device)
-        group_distances = []
+def format_noise_rate(noise_rate: float) -> str:
+    """Format noise rate for directory/file naming."""
+    rate_str = f"{noise_rate:.10g}"
+    return rate_str.replace(".", "_") if "." in rate_str and rate_str.endswith(".0") else rate_str
 
-        # Calculating distances against each noisy batch
-        for noisy_imgs in noisy_imgs_batches:
-            distances = torch.cdist(clean_imgs.view(len(clean_indices), -1), noisy_imgs.view(len(noisy_imgs), -1))
-            group_distances.append(distances.cpu())
 
-        # Concatenate all distances along the noisy dimension
-        concatenated_distances = torch.cat(group_distances, dim=1).numpy()
+def _load_raw_cifar10():
+    data_root = './data'
+    cifar_train = datasets.CIFAR10(root=data_root, train=True, download=True)
+    x_train = torch.from_numpy(cifar_train.data).permute(0, 3, 1, 2).float() / 255.0
+    y_train = torch.tensor(cifar_train.targets, dtype=torch.long)
 
-        # Find closest or farthest distances based on mode
-        if mode == 0:
-            min_distance = concatenated_distances.min()
-            min_index = concatenated_distances.argmin()
-            noisy_index_min = noisy_indices[min_index % len(noisy_indices)]
-            distances_results[tuple(clean_indices)] = ("closest", noisy_index_min, min_distance)
-        else:
-            max_distance = concatenated_distances.max()
-            max_index = concatenated_distances.argmax()
-            noisy_index_max = noisy_indices[max_index % len(noisy_indices)]
-            distances_results[tuple(clean_indices)] = ("farthest", noisy_index_max, max_distance)
+    cifar_test = datasets.CIFAR10(root=data_root, train=False, download=True)
+    x_test = torch.from_numpy(cifar_test.data).permute(0, 3, 1, 2).float() / 255.0
+    y_test = torch.tensor(cifar_test.targets, dtype=torch.long)
 
-    return distances_results
+    return TensorDataset(x_train, y_train), TensorDataset(x_test, y_test)
+
+
+def _load_raw_cifar100():
+    data_root = './data'
+    cifar_train = datasets.CIFAR100(root=data_root, train=True, download=True)
+    x_train = torch.from_numpy(cifar_train.data).permute(0, 3, 1, 2).float() / 255.0
+    y_train = torch.tensor(cifar_train.targets, dtype=torch.long)
+
+    cifar_test = datasets.CIFAR100(root=data_root, train=False, download=True)
+    x_test = torch.from_numpy(cifar_test.data).permute(0, 3, 1, 2).float() / 255.0
+    y_test = torch.tensor(cifar_test.targets, dtype=torch.long)
+
+    return TensorDataset(x_train, y_train), TensorDataset(x_test, y_test)
+
+
+def _load_raw_emnist_digits():
+    data_root = './data/EMNIST'
+    image_files = {
+        "train": os.path.join(data_root, "emnist-digits-train-images-idx3-ubyte.gz"),
+        "test": os.path.join(data_root, "emnist-digits-test-images-idx3-ubyte.gz"),
+    }
+    label_files = {
+        "train": os.path.join(data_root, "emnist-digits-train-labels-idx1-ubyte.gz"),
+        "test": os.path.join(data_root, "emnist-digits-test-labels-idx1-ubyte.gz"),
+    }
+
+    def _load_gz(path, is_image):
+        with gzip.open(path, 'rb') as f:
+            if is_image:
+                data = np.frombuffer(f.read(), dtype=np.uint8, offset=16).reshape(-1, 28, 28)
+            else:
+                data = np.frombuffer(f.read(), dtype=np.uint8, offset=8)
+        return data
+
+    try:
+        x_train = _load_gz(image_files["train"], is_image=True).copy()
+        y_train = _load_gz(label_files["train"], is_image=False).copy()
+        x_test = _load_gz(image_files["test"], is_image=True).copy()
+        y_test = _load_gz(label_files["test"], is_image=False).copy()
+    except FileNotFoundError:
+        # Fallback to torchvision dataset download if local files are unavailable.
+        torchvision_root = './data'
+        train_ds = datasets.EMNIST(root=torchvision_root, split='digits', train=True, download=True)
+        test_ds = datasets.EMNIST(root=torchvision_root, split='digits', train=False, download=True)
+        x_train = train_ds.data.numpy().copy()
+        y_train = train_ds.targets.numpy().copy()
+        x_test = test_ds.data.numpy().copy()
+        y_test = test_ds.targets.numpy().copy()
+    except Exception as exc:
+        raise RuntimeError(f"Failed to load EMNIST digits data: {exc}") from exc
+
+    x_train_tensor = torch.from_numpy(x_train).unsqueeze(1).float() / 255.0
+    y_train_tensor = torch.from_numpy(y_train).long()
+
+    x_test_tensor = torch.from_numpy(x_test).unsqueeze(1).float() / 255.0
+    y_test_tensor = torch.from_numpy(y_test).long()
+
+    return TensorDataset(x_train_tensor, y_train_tensor), TensorDataset(x_test_tensor, y_test_tensor)
+
+
+DATASET_CACHE_CONFIG = {
+    "cifar10": {
+        "base_dir": "/workspace/data/cifar10",
+        "noise_subdir": "cifar10_noise_{rate}",
+        "transform_path": "/workspace/data/cifar10/transform.json",
+        "raw_loader": _load_raw_cifar10,
+        "imagesize": (32, 32),
+        "num_classes": 10,
+        "in_channels": 3,
+        "num_digits": 10,
+        "num_colors": 1,
+        "default_transforms": DEFAULT_TRANSFORM_SPECS["cifar10"],
+    },
+    "cifar100": {
+        "base_dir": "/workspace/data/cifar100",
+        "noise_subdir": "cifar100_noise_{rate}",
+        "transform_path": "/workspace/data/cifar100/transform.json",
+        "raw_loader": _load_raw_cifar100,
+        "imagesize": (32, 32),
+        "num_classes": 100,
+        "in_channels": 3,
+        "num_digits": 100,
+        "num_colors": 1,
+        "default_transforms": DEFAULT_TRANSFORM_SPECS["cifar100"],
+    },
+    "emnist_digits": {
+        "base_dir": "/workspace/data/EMNIST",
+        "noise_subdir": "emnist_digits_noise_{rate}",
+        "transform_path": "/workspace/data/EMNIST/transform_digits.json",
+        "raw_loader": _load_raw_emnist_digits,
+        "imagesize": (32, 32),
+        "num_classes": 10,
+        "in_channels": 1,
+        "num_digits": 10,
+        "num_colors": 1,
+        "default_transforms": DEFAULT_TRANSFORM_SPECS["emnist_digits"],
+    },
+}
+
+
+def _normalize_spec_if_missing(spec, dataset_key):
+    stats = DATASET_NORMALIZATION_STATS.get(dataset_key)
+    if stats is None:
+        return list(spec)
+    has_normalize = any(step.get("name") == "Normalize" for step in spec)
+    if has_normalize:
+        return list(spec)
+    mean = stats["mean"]
+    std = stats["std"]
+    spec_with_norm = list(spec) + [{"name": "Normalize", "params": {"mean": mean, "std": std}}]
+    return spec_with_norm
+
+
+def _ensure_transform_file(dataset_key, config):
+    path = config["transform_path"]
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    if not os.path.exists(path):
+        default_spec = config.get("default_transforms", {"train": [], "test": []})
+        with open(path, "w") as f:
+            json.dump(default_spec, f, indent=2)
+    return path
+
+
+def _build_transform_from_spec(spec, dataset_key):
+    if not spec:
+        return None
+    transform_objects = []
+    for entry in spec:
+        name = entry.get("name")
+        params = entry.get("params", {})
+        if name not in TRANSFORM_REGISTRY:
+            print(f"Warning: transform '{name}' は未登録です。スキップします。")
+            continue
+        transform_cls = TRANSFORM_REGISTRY[name]
+        transform_objects.append(transform_cls(**params))
+    if not transform_objects:
+        return None
+    return transforms.Compose(transform_objects)
+
+
+def load_transforms_for_dataset(dataset_key, config):
+    path = _ensure_transform_file(dataset_key, config)
+    with open(path, "r") as f:
+        spec_data = json.load(f)
+
+    default_specs = config.get("default_transforms", {"train": [], "test": []})
+
+    if "train" in spec_data or "test" in spec_data:
+        train_spec = spec_data.get("train", default_specs.get("train", []))
+        test_spec = spec_data.get("test", default_specs.get("test", spec_data.get("train", [])))
+    elif "transforms" in spec_data:
+        train_spec = spec_data["transforms"]
+        test_spec = default_specs.get("test", train_spec)
+    else:
+        train_spec = default_specs.get("train", [])
+        test_spec = default_specs.get("test", train_spec)
+
+    train_spec = _normalize_spec_if_missing(train_spec, dataset_key)
+    test_spec = _normalize_spec_if_missing(test_spec, dataset_key)
+
+    return (
+        _build_transform_from_spec(train_spec, dataset_key),
+        _build_transform_from_spec(test_spec, dataset_key),
+    )
 class NoisyDataset(Dataset):
     """
     Custom dataset that includes noise information.
     """
-    def __init__(self, dataset, noise_info):
+    def __init__(self, dataset, noise_info, transform=None):
         self.dataset = dataset
         self.noise_info = noise_info
+        self.transform = transform
 
     def __len__(self):
         return len(self.dataset)
 
     def __getitem__(self, idx):
         input, label = self.dataset[idx]
+        if isinstance(input, torch.Tensor):
+            input = input.clone()
+        if self.transform is not None:
+            input = self.transform(input)
         noise_label = self.noise_info[idx]
         return input, label, noise_label
+
+    def set_transform(self, transform):
+        self.transform = transform
 
 class BalancedBatchSampler(Sampler):
     """
@@ -122,9 +336,6 @@ class BalancedBatchSampler(Sampler):
                 random.shuffle(batch)
                 yield batch
 
-    def __len__(self):
-        return len(self.clean_indices) // self.num_samples_per_class
-
 def load_datasets(dataset, target, gray_scale, args):
     """Load dataset with optional grayscale conversion.
 
@@ -147,21 +358,6 @@ def load_datasets(dataset, target, gray_scale, args):
 
     dataset = dataset.lower()
 
-    # def _create_dummy_dataset(n_samples, size, num_classes, in_channels):
-    #     """Return fallback data when real dataset cannot be loaded."""
-    #     x = torch.rand(n_samples, in_channels, size[0], size[1])
-    #     y = torch.randint(num_classes, (n_samples,))
-    #     return TensorDataset(x, y)
-
-    # def _safe_load(fn, size, num_classes, in_channels):
-    #     try:
-    #         return fn()
-    #     except Exception as exc:
-    #         print(f"Warning: failed to load dataset ({exc}). Using dummy data.")
-    #         train = _create_dummy_dataset(1000, size, num_classes, in_channels)
-    #         test = _create_dummy_dataset(200, size, num_classes, in_channels)
-    #         return train, test
-
     def _load_mnist(_, __, ___):
         transform = transforms.Compose([
             transforms.ToTensor(),
@@ -173,7 +369,7 @@ def load_datasets(dataset, target, gray_scale, args):
             test = datasets.MNIST(root='./data', train=False, download=True, transform=transform)
             return train, test
 
-        train_ds, test_ds = _safe_load(loader, (32, 32), 10, 1)
+        # train_ds, test_ds = _safe_load(loader, (32, 32), 10, 1)
         return train_ds, test_ds, (32, 32), 10, 1
 
     def _load_emnist(_, __, ___):
@@ -316,18 +512,37 @@ def load_datasets(dataset, target, gray_scale, args):
         return train_ds, test_ds, (32, 32), num_classes, 3
 
     def _load_cifar10(_, __, ___):
-        transform = transforms.Compose([
-            transforms.RandomCrop(32, padding=4),
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))
-        ])
-        def loader():
-            train = datasets.CIFAR10(root='./data', train=True, download=True, transform=transform)
-            test = datasets.CIFAR10(root='./data', train=False, download=True, transform=transform)
-            return train, test
+        data_root = './data'
+        archive_path = os.path.join(data_root, 'cifar-10-python.tar.gz')
+        extracted_dir = os.path.join(data_root, 'cifar-10-batches-py')
 
-        train_ds, test_ds = _safe_load(loader, (32, 32), 10, 3)
+        if not os.path.isdir(extracted_dir):
+            if not os.path.isfile(archive_path):
+                raise FileNotFoundError(f"CIFAR-10 archive not found at {archive_path}")
+
+            def _is_within_directory(directory, target):
+                abs_directory = os.path.abspath(directory)
+                abs_target = os.path.abspath(target)
+                return os.path.commonpath([abs_directory, abs_target]) == abs_directory
+
+            with tarfile.open(archive_path, 'r:gz') as tar:
+                for member in tar.getmembers():
+                    member_path = os.path.join(data_root, member.name)
+                    if not _is_within_directory(data_root, member_path):
+                        raise RuntimeError(f"Unsafe path detected in archive member {member.name}")
+                tar.extractall(path=data_root)
+
+        # 0-1 range float tensors without any augmentation/normalization
+        cifar_train = datasets.CIFAR10(root=data_root, train=True, download=False)
+        x_train = torch.from_numpy(cifar_train.data).permute(0, 3, 1, 2).float() / 255.0
+        y_train = torch.tensor(cifar_train.targets, dtype=torch.long)
+        train_ds = TensorDataset(x_train, y_train)
+
+        cifar_test = datasets.CIFAR10(root=data_root, train=False, download=False)
+        x_test = torch.from_numpy(cifar_test.data).permute(0, 3, 1, 2).float() / 255.0
+        y_test = torch.tensor(cifar_test.targets, dtype=torch.long)
+        test_ds = TensorDataset(x_test, y_test)
+
         return train_ds, test_ds, (32, 32), 10, 3
 
     def _load_cifar100(_, __, ___):
@@ -634,63 +849,100 @@ def apply_label_noise_to_dataset(dataset, noise_rate, num_digits=10, num_colors=
     return NoisyDataset(base_dataset, noise_tensor)
 
 
-# load_datasetsは、各データセット固有のデータ拡張（transform）を適用して読み込む既存の関数とする
-# （ここでは既に定義済みのものとして利用）
+def _load_or_create_cached_dataset(dataset_key, noise_rate, return_type="torch"):
+    config = DATASET_CACHE_CONFIG[dataset_key]
+    rate_str = format_noise_rate(noise_rate)
+    cache_dir = os.path.join(config["base_dir"], config["noise_subdir"].format(rate=rate_str))
+    os.makedirs(cache_dir, exist_ok=True)
 
-# --- 新規関数群 ---
-class NoisyDataset(Dataset):
-    """
-    Custom dataset that includes noise information.
-    """
-    def __init__(self, dataset, noise_info):
-        self.dataset = dataset
-        self.noise_info = noise_info
+    train_file = os.path.join(cache_dir, "train_data.pt")
+    test_file = os.path.join(cache_dir, "test_data.pt")
+    meta_file = os.path.join(cache_dir, "meta.pt")
 
-    def __len__(self):
-        return len(self.dataset)
+    cache_exists = all(os.path.exists(path) for path in (train_file, test_file, meta_file))
 
-    def __getitem__(self, idx):
-        input, label = self.dataset[idx]
-        noise_label = self.noise_info[idx]
-        return input, label, noise_label
-import json
-from torchvision import transforms
-from torch.utils.data import Dataset
+    if cache_exists:
+        print(f"[DatasetCache] Loaded cached dataset '{dataset_key}' (noise_rate={noise_rate}) from {cache_dir}")
+    else:
+        print(f"[DatasetCache] Creating cached dataset '{dataset_key}' (noise_rate={noise_rate}) at {cache_dir}")
+        raw_train, raw_test = config["raw_loader"]()
+        noisy_train = apply_label_noise_to_dataset(
+            raw_train, noise_rate, num_digits=config["num_digits"], num_colors=config["num_colors"]
+        )
 
-# -----------------------------------------
-# ① transform.json を読み込み、transforms.Compose を返す関数
-# -----------------------------------------
-def load_transform_from_json(json_path):
-    """
-    transform.json を読み込み、transforms.Compose を返す。
-    ToTensor, Normalize, Resize, Grayscale などは除外推奨。
-    """
-    # どの transform を実際にインスタンス化できるか管理する辞書
-    TRANSFORM_REGISTRY = {
-        "RandomCrop": transforms.RandomCrop,
-        "RandomHorizontalFlip": transforms.RandomHorizontalFlip,
-        # "RandomRotation": transforms.RandomRotation,
-        # "ColorJitter": transforms.ColorJitter,
-        # "GaussianBlur": transforms.GaussianBlur,
-        "Normalize":transforms.Normalize,
-        # 必要に応じて増やせます
-    }
+        x_train, y_train = noisy_train.dataset.tensors
+        noise_info = noisy_train.noise_info.clone()
 
-    with open(json_path, "r") as f:
-        meta = json.load(f)
+        x_test, y_test = raw_test.tensors
 
-    transform_list = []
-    for t in meta["transforms"]:
-        name = t["name"]
-        params = t.get("params", {})
+        torch.save({
+            "x_train": x_train.clone(),
+            "y_train": y_train.clone(),
+            "noise_info": noise_info.clone(),
+        }, train_file)
 
-        if name in TRANSFORM_REGISTRY:
-            transform_cls = TRANSFORM_REGISTRY[name]
-            transform_list.append(transform_cls(**params))
-        else:
-            print(f"Warning: transform '{name}' は未登録です。スキップします。")
+        torch.save({
+            "x_test": x_test.clone(),
+            "y_test": y_test.clone(),
+        }, test_file)
 
-    return transforms.Compose(transform_list)
+        meta = {
+            "imagesize": config["imagesize"],
+            "num_classes": config["num_classes"],
+            "in_channels": config["in_channels"],
+            "noise_rate": noise_rate,
+        }
+        torch.save(meta, meta_file)
+        print(f"[DatasetCache] Saved new cache for '{dataset_key}' to {cache_dir}")
+
+    train_data = torch.load(train_file)
+    test_data = torch.load(test_file)
+    meta = torch.load(meta_file)
+
+    x_train = train_data["x_train"].float()
+    y_train = train_data["y_train"].long()
+    noise_info = train_data["noise_info"].long()
+
+    x_test = test_data["x_test"].float()
+    y_test = test_data["y_test"].long()
+
+    stats = DATASET_NORMALIZATION_STATS.get(dataset_key)
+    if stats is not None:
+        mean_tensor = torch.tensor(stats["mean"], dtype=x_train.dtype).view(1, -1, 1, 1)
+        std_tensor = torch.tensor(stats["std"], dtype=x_train.dtype).view(1, -1, 1, 1)
+
+        def _maybe_denormalize(tensor):
+            if tensor.max() <= 1.0 and tensor.min() >= 0.0:
+                return tensor, False
+            restored = tensor * std_tensor + mean_tensor
+            return restored.clamp(0.0, 1.0), True
+
+        x_train, _ = _maybe_denormalize(x_train)
+        x_test, _ = _maybe_denormalize(x_test)
+
+    train_tensor_dataset = TensorDataset(x_train, y_train)
+    train_dataset = NoisyDataset(train_tensor_dataset, noise_info)
+    test_dataset = TensorDataset(x_test, y_test)
+
+    train_transform, test_transform = load_transforms_for_dataset(dataset_key, config)
+    if train_transform is not None:
+        train_dataset.set_transform(train_transform)
+    print(f"[DatasetCache] Train transform for '{dataset_key}': {_describe_transform(train_transform)}")
+    if test_transform is not None:
+        test_dataset = TransformedDataset(test_dataset, test_transform)
+    print(f"[DatasetCache] Test transform for '{dataset_key}': {_describe_transform(test_transform)}")
+
+    if return_type == "npy":
+        return (
+            x_train.numpy(),
+            y_train.numpy(),
+            noise_info.numpy(),
+            x_test.numpy(),
+            y_test.numpy(),
+            meta,
+        )
+
+    return train_dataset, test_dataset, meta
 
 # -----------------------------------------
 # ② 既存Datasetに transform をかけ直すためのラッパー
@@ -704,6 +956,8 @@ class TransformedDataset(Dataset):
         data = self.base_dataset[idx]
         # (x, y) or (x, y, noise_flag) を考慮
         x, y = data[:2]
+        if isinstance(x, torch.Tensor):
+            x = x.clone()
         # x に transform を適用 (Tensor -> PIL に変換不要な augment のみ推奨)
         x = self.transform(x)
         # 3つ目の要素 (noise_flag) がある場合もそのまま返却
@@ -732,12 +986,15 @@ def load_or_create_noisy_dataset(dataset, target, gray_scale, args, return_type=
     """
     label_noise_rate = args.label_noise_rate
 
-    # データセットごとに、_handle_*関数に分割
-    if dataset.lower() in ["cifar10"]:
-        return _handle_cifar10(args, return_type)
-    elif dataset.lower() in ["emnist", "emnist_digits"]:
+    dataset_key = dataset.lower()
+
+    if dataset_key in DATASET_CACHE_CONFIG:
+        return _load_or_create_cached_dataset(dataset_key, label_noise_rate, return_type)
+
+    # 既存ロジックはその他のデータセット向けに残しておく
+    if dataset_key in ["emnist", "emnist_digits"]:
         return _handle_emnist_digits(target, gray_scale, args, return_type)
-    elif "distribution_colored_emnist" in dataset.lower():
+    elif "distribution_colored_emnist" in dataset_key:
         print("distribution_colored_emnist")
         print(target)
         return _handle_distribution_colored_emnist(dataset, target, gray_scale, args, return_type)
@@ -860,9 +1117,13 @@ def _load_or_save_dataset(dataset,train_dir, test_dir, noise_num_colors, gray_sc
         )
 
         # 学習データの準備
-        x_list, y_list = zip(*[(x, y) for x, y in full_train_dataset])
-        x_train = torch.stack(x_list)
-        y_train = torch.tensor(y_list)
+        if isinstance(full_train_dataset, TensorDataset):
+            x_train, y_train = full_train_dataset.tensors
+        else:
+            x_list, y_list = zip(*[(x, y) for x, y in full_train_dataset])
+            x_train = torch.stack(x_list)
+            y_train = torch.tensor(y_list)
+        x_train = x_train.float()
 
         # ラベルノイズの付加
         print(f"Adding label noise with rate: {label_noise_rate}")
@@ -889,9 +1150,13 @@ def _load_or_save_dataset(dataset,train_dir, test_dir, noise_num_colors, gray_sc
             }, train_file)
 
         if not test_files_exist:
-            x_test_list, y_test_list = zip(*[(x, y) for x, y in full_test_dataset])
-            x_test = torch.stack([x for x in x_test_list])
-            y_test = torch.tensor(y_test_list)
+            if isinstance(full_test_dataset, TensorDataset):
+                x_test, y_test = full_test_dataset.tensors
+            else:
+                x_test_list, y_test_list = zip(*[(x, y) for x, y in full_test_dataset])
+                x_test = torch.stack(list(x_test_list))
+                y_test = torch.tensor(y_test_list)
+            x_test = x_test.float()
 
             os.makedirs(test_dir, exist_ok=True)
             torch.save({
@@ -908,15 +1173,40 @@ def _load_or_save_dataset(dataset,train_dir, test_dir, noise_num_colors, gray_sc
         print(f"  - {test_file}")
         print(f"  - {meta_file}")
         train_data = torch.load(train_file)
-        x_train = train_data["x_train"]
+        x_train = train_data["x_train"].float()
         y_train = train_data["y_train"]
         noise_info = train_data["noise_info"]
 
         test_data = torch.load(test_file)
-        x_test = test_data["x_test"]
+        x_test = test_data["x_test"].float()
         y_test = test_data["y_test"]
 
         meta = torch.load(meta_file)
+
+        if dataset.lower() == "cifar10":
+            stats = DATASET_NORMALIZATION_STATS["cifar10"]
+            mean = torch.tensor(stats["mean"], dtype=x_train.dtype).view(1, -1, 1, 1)
+            std = torch.tensor(stats["std"], dtype=x_train.dtype).view(1, -1, 1, 1)
+
+            def _maybe_denormalize(tensor):
+                if tensor.min() < 0 or tensor.max() > 1:
+                    denorm = tensor * std + mean
+                    return denorm.clamp(0.0, 1.0), True
+                return tensor, False
+
+            x_train, converted_train = _maybe_denormalize(x_train)
+            x_test, converted_test = _maybe_denormalize(x_test)
+
+            if converted_train or converted_test:
+                torch.save({
+                    "x_train": x_train,
+                    "y_train": y_train,
+                    "noise_info": noise_info
+                }, train_file)
+                torch.save({
+                    "x_test": x_test,
+                    "y_test": y_test
+                }, test_file)
 
     if return_type == "npy":
         # NumPy配列として返却
@@ -926,22 +1216,12 @@ def _load_or_save_dataset(dataset,train_dir, test_dir, noise_num_colors, gray_sc
         )
 
     elif return_type == "torch":
-        train_dataset = TensorDataset(x_train, y_train)
+        train_tensor_dataset = TensorDataset(x_train, y_train)
         
         # ラベルノイズがなくても NoisyDataset を使う（noise_info は全て0）
-        train_dataset = NoisyDataset(train_dataset, noise_info)
+        train_dataset = NoisyDataset(train_tensor_dataset, noise_info)
 
         test_dataset = TensorDataset(x_test, y_test)
-
-        json_path = os.path.join(test_dir, "transform.json")
-        # if os.path.exists(json_path):
-        #     print("transform.json が存在するため、augment を適用します。")
-        #     # augment_transform = load_transform_from_json(json_path)
-        # augment_transform=transforms.Compose([
-        #         transforms.Normalize((0.1307,), (0.3081,))
-        #     ])
-        # print("Transform:", augment_transform)
-        # train_dataset = TransformedDataset(train_dataset, augment_transform)
 
         return train_dataset, test_dataset, meta
 
